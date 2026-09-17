@@ -1,0 +1,5 @@
+{
+  "source": "SMPTE RP 177 primary-matrix derivation using CSS Color 4 chromaticities; linear Bradford adaptation using the published Bradford matrix and CSS D50/D65 white points",
+  "encoding": "SHA-256 over the little-endian f64 bytes of matrices 0 through 11 in ABI index order",
+  "digest": "5a0ad8629beab80838dcdc28e9c0821f91e1ee04268ec10a5532e31d910cecfd"
+}

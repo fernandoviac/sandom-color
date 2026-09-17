@@ -1,0 +1,20 @@
+{
+  "kind": "sandom/webassembly-source-manifest",
+  "version": 1,
+  "module": "color",
+  "embeddable": {
+    "components": ["color-abi.watpart", "color-kernel.watpart"],
+    "scratchBytes": 9728,
+    "requires": ["memory", "$COLOR_BASE"]
+  },
+  "components": [
+    "color-module.watpart",
+    "color-abi.watpart",
+    "color-kernel.watpart",
+    "color-runtime.watpart",
+    "color-packing.watpart",
+    "color-source.watpart",
+    "color-profile.watpart",
+    "color-output.watpart"
+  ]
+}

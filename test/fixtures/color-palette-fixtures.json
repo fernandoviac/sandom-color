@@ -1,0 +1,152 @@
+{
+  "provenance": "Reviewed derivation of ABI v2 uniform-cube ordering and integer arithmetic. The 6 by 7 by 6 case preserves Sandom gif-encoder.wat at commit d5e6d443: channel value floor(level * 255 / (levels - 1)), channel rounding floor((byte * (levels - 1) + 127) / 255), red-major cube order, and transparent slot 0. The 2-level and boundary cases apply the same maintained rule directly.",
+  "uniform": [
+    {
+      "id": "6x7x6-transparent-zero",
+      "redLevels": 6,
+      "greenLevels": 7,
+      "blueLevels": 6,
+      "transparent": 0,
+      "entries": 253,
+      "expected": "0000000000000000330000660000990000cc0000ff002a00002a33002a66002a99002acc002aff0055000055330055660055990055cc0055ff007f00007f33007f66007f99007fcc007fff00aa0000aa3300aa6600aa9900aacc00aaff00d40000d43300d46600d49900d4cc00d4ff00ff0000ff3300ff6600ff9900ffcc00ffff3300003300333300663300993300cc3300ff332a00332a33332a66332a99332acc332aff3355003355333355663355993355cc3355ff337f00337f33337f66337f99337fcc337fff33aa0033aa3333aa6633aa9933aacc33aaff33d40033d43333d46633d49933d4cc33d4ff33ff0033ff3333ff6633ff9933ffcc33ffff6600006600336600666600996600cc6600ff662a00662a33662a66662a99662acc662aff6655006655336655666655996655cc6655ff667f00667f33667f66667f99667fcc667fff66aa0066aa3366aa6666aa9966aacc66aaff66d40066d43366d46666d49966d4cc66d4ff66ff0066ff3366ff6666ff9966ffcc66ffff9900009900339900669900999900cc9900ff992a00992a33992a66992a99992acc992aff9955009955339955669955999955cc9955ff997f00997f33997f66997f99997fcc997fff99aa0099aa3399aa6699aa9999aacc99aaff99d40099d43399d46699d49999d4cc99d4ff99ff0099ff3399ff6699ff9999ffcc99ffffcc0000cc0033cc0066cc0099cc00cccc00ffcc2a00cc2a33cc2a66cc2a99cc2acccc2affcc5500cc5533cc5566cc5599cc55cccc55ffcc7f00cc7f33cc7f66cc7f99cc7fcccc7fffccaa00ccaa33ccaa66ccaa99ccaaccccaaffccd400ccd433ccd466ccd499ccd4ccccd4ffccff00ccff33ccff66ccff99ccffccccffffff0000ff0033ff0066ff0099ff00ccff00ffff2a00ff2a33ff2a66ff2a99ff2accff2affff5500ff5533ff5566ff5599ff55ccff55ffff7f00ff7f33ff7f66ff7f99ff7fccff7fffffaa00ffaa33ffaa66ffaa99ffaaccffaaffffd400ffd433ffd466ffd499ffd4ccffd4ffffff00ffff33ffff66ffff99ffffccffffff"
+    },
+    {
+      "id": "2x2x2-no-transparency",
+      "redLevels": 2,
+      "greenLevels": 2,
+      "blueLevels": 2,
+      "transparent": -1,
+      "entries": 8,
+      "expected": "0000000000ff00ff0000ffffff0000ff00ffffff00ffffff"
+    },
+    {
+      "id": "2x2x2-transparent-four",
+      "redLevels": 2,
+      "greenLevels": 2,
+      "blueLevels": 2,
+      "transparent": 4,
+      "entries": 9,
+      "expected": "0000000000ff00ff0000ffff000000ff0000ff00ffffff00ffffff"
+    }
+  ],
+  "index": [
+    {
+      "id": "threshold-at-and-above",
+      "uniform": "6x7x6-transparent-zero",
+      "threshold": 127,
+      "input": "ffffff7f0000008000ff00ff008000ff",
+      "expected": "00012513"
+    },
+    {
+      "id": "2-level-rounding-boundary",
+      "uniform": "2x2x2-no-transparency",
+      "threshold": 0,
+      "input": "7f7f7f0080808000",
+      "expected": "0007"
+    },
+    {
+      "id": "explicit-transparent-slot-skip",
+      "uniform": "2x2x2-transparent-four",
+      "threshold": 0,
+      "input": "ff0000ff12345600ffffff01",
+      "expected": "050408"
+    }
+  ],
+  "errors": [
+    {
+      "id": "red-level-below-two",
+      "op": "uniform",
+      "redLevels": 1,
+      "greenLevels": 2,
+      "blueLevels": 2,
+      "transparent": -1,
+      "capacity": 24,
+      "code": 17,
+      "field": 0
+    },
+    {
+      "id": "levels-exceed-entry-limit",
+      "op": "uniform",
+      "redLevels": 7,
+      "greenLevels": 7,
+      "blueLevels": 6,
+      "transparent": 0,
+      "capacity": 768,
+      "code": 17,
+      "field": 16
+    },
+    {
+      "id": "transparent-slot-out-of-range",
+      "op": "uniform",
+      "redLevels": 2,
+      "greenLevels": 2,
+      "blueLevels": 2,
+      "transparent": 9,
+      "capacity": 27,
+      "code": 20,
+      "field": 12
+    },
+    {
+      "id": "palette-span-short",
+      "op": "uniform",
+      "redLevels": 2,
+      "greenLevels": 2,
+      "blueLevels": 2,
+      "transparent": -1,
+      "capacity": 23,
+      "code": 19,
+      "field": 2
+    },
+    {
+      "id": "threshold-above-byte",
+      "op": "index",
+      "uniform": "6x7x6-transparent-zero",
+      "threshold": 256,
+      "input": "000000ff",
+      "capacity": 1,
+      "code": 18,
+      "field": 3
+    },
+    {
+      "id": "threshold-must-be-zero-without-transparency",
+      "op": "index",
+      "uniform": "2x2x2-no-transparency",
+      "threshold": 1,
+      "input": "000000ff",
+      "capacity": 1,
+      "code": 18,
+      "field": 3
+    },
+    {
+      "id": "rgba-span-not-whole-pixels",
+      "op": "index",
+      "uniform": "6x7x6-transparent-zero",
+      "threshold": 0,
+      "input": "000000",
+      "capacity": 1,
+      "code": 19,
+      "field": 2
+    },
+    {
+      "id": "index-span-short",
+      "op": "index",
+      "uniform": "6x7x6-transparent-zero",
+      "threshold": 0,
+      "input": "000000ffffffff00",
+      "capacity": 1,
+      "code": 19,
+      "field": 5
+    },
+    {
+      "id": "entries-must-match-built-record",
+      "op": "index-record",
+      "uniform": "2x2x2-no-transparency",
+      "entries": 7,
+      "threshold": 0,
+      "input": "000000ff",
+      "capacity": 1,
+      "code": 20,
+      "field": 16
+    }
+  ]
+}

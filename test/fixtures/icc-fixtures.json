@@ -1,0 +1,112 @@
+{
+  "provenance": "Synthetic ICC.1 byte layouts reviewed against the ICC tag signatures and fixed-point encodings. Matrix/TRC expectations use the CSS Color 4 D50 matrix and the package Bradford step. LUT samples lie on two-point grid nodes or use identity ramps, so expected results do not depend on an outside interpolation implementation. The Display P3 chad fixture is the owned canonical profile plus structurally valid Bradford metadata.",
+  "accepted": [
+    {
+      "file": "icc/matrix-curv.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 1502144702,
+      "xyzF64": "f46d88df463dd03f91df82cbee07d03fec607a82aa0ae43f",
+      "srgb": "638ad080"
+    },
+    {
+      "file": "icc/matrix-para0.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 2284092607,
+      "xyzF64": "5c71db605bbccb3fe82b6afd74c8cd3fc61b036f181ae23f",
+      "srgb": "4789c680"
+    },
+    {
+      "file": "icc/matrix-para1.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 44426855,
+      "xyzF64": "5c71db605bbccb3fe82b6afd74c8cd3fc61b036f181ae23f",
+      "srgb": "4789c680"
+    },
+    {
+      "file": "icc/matrix-para2.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 4092469506,
+      "xyzF64": "d43220d08778d53fbaacaadd3be4d63f3c6c92cb4975e63f",
+      "srgb": "78a5d980"
+    },
+    {
+      "file": "icc/matrix-para3.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 4165603597,
+      "xyzF64": "5c71db605bbccb3fe82b6afd74c8cd3fc61b036f181ae23f",
+      "srgb": "4789c680"
+    },
+    {
+      "file": "icc/matrix-para4.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 1322685828,
+      "xyzF64": "4165f5ca4dd2d33fe55c3db97a0ad63faf9b743b686be63f",
+      "srgb": "63a5d980"
+    },
+    {
+      "file": "icc/matrix-scnr.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 3762566400,
+      "xyzF64": "5c71db605bbccb3fe82b6afd74c8cd3fc61b036f181ae23f",
+      "srgb": "4789c680"
+    },
+    {
+      "file": "icc/matrix-spac.icc",
+      "kind": 0,
+      "srgbLike": 1,
+      "identity": 2870881789,
+      "xyzF64": "5c71db605bbccb3fe82b6afd74c8cd3fc61b036f181ae23f",
+      "srgb": "4789c680"
+    },
+    {
+      "file": "icc/mft1-xyz.icc",
+      "kind": 1,
+      "srgbLike": 0,
+      "identity": 861500546,
+      "xyzF64": "542524e9ec94e73f3d9fe8591c75f33fa655052821d70140",
+      "srgb": "00ffff80"
+    },
+    {
+      "file": "icc/mft2-lab.icc",
+      "kind": 1,
+      "srgbLike": 0,
+      "identity": 3029152114,
+      "xyzF64": "0b155b3ba818a43f2931028b6e41a63ff15d8c27deb38ebf",
+      "srgb": "4b3a0080"
+    },
+    {
+      "file": "icc/mab-lab.icc",
+      "kind": 1,
+      "srgbLike": 0,
+      "identity": 1534108981,
+      "xyzF64": "b692305f02c9a33fd6489de7e01aa63f66f43499e8de8dbf",
+      "srgb": "4a3a0080"
+    }
+  ],
+  "acceptedChad": [
+    {
+      "file": "icc/display-p3-chad.icc",
+      "kind": 0,
+      "srgbLike": 0
+    }
+  ],
+  "rejected": [
+    { "file": "icc/reject-short.icc", "code": 5, "field": 0 },
+    { "file": "icc/reject-class.icc", "code": 6, "field": 12 },
+    { "file": "icc/reject-cmyk.icc", "code": 10, "field": 16 },
+    { "file": "icc/reject-gray.icc", "code": 11, "field": 16 },
+    { "file": "icc/reject-n-channel.icc", "code": 12, "field": 16 },
+    { "file": "icc/reject-intent.icc", "code": 14, "field": 64 },
+    { "file": "icc/reject-b2a.icc", "code": 9, "field": 128 },
+    { "file": "icc/reject-black-point.icc", "code": 15, "field": 128 },
+    { "file": "icc/reject-chad.icc", "code": 16, "field": 128 },
+    { "file": "icc/reject-mpet.icc", "code": 13, "field": 144 }
+  ]
+}

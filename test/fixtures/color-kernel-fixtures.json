@@ -1,0 +1,183 @@
+{
+  "provenance": "Exact little-endian f64 results reviewed from IEC 61966-2-1, CSS Color 4, SMPTE ST 2084, ITU-R BT.2100/BT.2390/BT.2408, and the published Bradford and OKLab transforms. Expected bits fix the ABI v2 WAT operation order.",
+  "scalar": [
+    { "op": "srgb_decode", "args": [0.5], "expectedF64": "55532f39b365cb3f" },
+    { "op": "srgb_encode", "args": [0.5], "expectedF64": "4f0e235e0b88e73f" },
+    {
+      "op": "gamma_decode",
+      "args": [0.5, 2.2],
+      "expectedF64": "1fe1dbda8cdbcb3f"
+    },
+    {
+      "op": "gamma_encode",
+      "args": [0.5, 2.2],
+      "expectedF64": "ee07b1cf075ae73f"
+    },
+    {
+      "op": "pq_signal_to_luminance",
+      "args": [1],
+      "expectedF64": "000000000088c340"
+    },
+    {
+      "op": "luminance_to_pq_signal",
+      "args": [203],
+      "expectedF64": "8b2f27d90095e23f"
+    },
+    {
+      "op": "hlg_signal_to_scene",
+      "args": [0.5],
+      "expectedF64": "555555555555b53f"
+    },
+    {
+      "op": "scene_to_hlg_signal",
+      "args": [0.08333333333333333],
+      "expectedF64": "000000000000e03f"
+    },
+    {
+      "op": "rec2020_decode",
+      "args": [0.5],
+      "expectedF64": "a80b1f463e9fd03f"
+    },
+    {
+      "op": "rec2020_encode",
+      "args": [0.5],
+      "expectedF64": "dde7b994ed92e63f"
+    },
+    {
+      "op": "prophoto_decode",
+      "args": [0.5],
+      "expectedF64": "74e6ba861161d23f"
+    },
+    {
+      "op": "prophoto_encode",
+      "args": [0.5],
+      "expectedF64": "859037bccbc5e53f"
+    }
+  ],
+  "tagged": [
+    {
+      "id": "srgb",
+      "primaries": 0,
+      "transfer": 0,
+      "gamma": 1,
+      "missing": 0,
+      "input": [0.25, 0.5, 0.75],
+      "expectedF64": "d533d14b0c01c03fbd068b5b1e67ca3fc2ec26587f35df3f"
+    },
+    {
+      "id": "linear",
+      "primaries": 2,
+      "transfer": 1,
+      "gamma": 1,
+      "missing": 0,
+      "input": [0.25, 0.5, 0.75],
+      "expectedF64": "000000000000d03f000000000000e03f000000000000e83f"
+    },
+    {
+      "id": "gamma",
+      "primaries": 3,
+      "transfer": 2,
+      "gamma": 2.19921875,
+      "missing": 0,
+      "input": [0.25, 0.5, 0.75],
+      "expectedF64": "3af58b03be1cb53f10e2a2e1cc3dca3f92e8ccef0036e03f"
+    },
+    {
+      "id": "pq",
+      "primaries": 2,
+      "transfer": 3,
+      "gamma": 1,
+      "missing": 0,
+      "input": [0.25, 0.5, 0.75],
+      "expectedF64": "da7c310bd8ff993fceebd1931715dd3f8bec68c07c601340"
+    },
+    {
+      "id": "hlg",
+      "primaries": 2,
+      "transfer": 4,
+      "gamma": 1,
+      "missing": 0,
+      "input": [0.25, 0.5, 0.75],
+      "expectedF64": "e918afee6185af3fe918afee6185cf3fba6a63b6400ee93f"
+    },
+    {
+      "id": "rec2020",
+      "primaries": 2,
+      "transfer": 5,
+      "gamma": 1,
+      "missing": 0,
+      "input": [0.25, 0.5, 0.75],
+      "expectedF64": "2dbf37d17f08b43fa80b1f463e9fd03ff5ee65bc3009e23f"
+    },
+    {
+      "id": "prophoto",
+      "primaries": 4,
+      "transfer": 6,
+      "gamma": 1,
+      "missing": 0,
+      "input": [0.25, 0.5, 0.75],
+      "expectedF64": "004b4bcfc5b166bf3dbac94aa815d33f748a8c56b660e33f"
+    },
+    {
+      "id": "missing-components",
+      "primaries": 2,
+      "transfer": 1,
+      "gamma": 1,
+      "missing": 5,
+      "input": [9, 0.5, 9],
+      "expectedF64": "0000000000000000000000000000e03f0000000000000000"
+    }
+  ],
+  "vector": [
+    {
+      "op": "tone_map_bt2390",
+      "args": [1000, 203],
+      "input": [3, 1.5, 0.75],
+      "expectedF64": "b9b264ec12c2ef3fb9b264ec12c2df3fb9b264ec12c2cf3f"
+    },
+    {
+      "op": "gamut_map_css_color_4",
+      "args": [1, 0, 0],
+      "input": [0, 1, 0],
+      "expectedF64": "00000000000000000218069ffde2eb3fb61e05f6a666c73f"
+    },
+    {
+      "op": "xyz_d65_to_oklab",
+      "args": [],
+      "input": [0.2, 0.5, 0.4],
+      "expectedF64": "25c88e0c4b57e83fa92cffe657e9d0bfd06584fd65f7a33f"
+    },
+    {
+      "op": "lab_to_xyz_d50",
+      "args": [],
+      "input": [50, 40, -30],
+      "expectedF64": "5505bf851fded03f8401b0806c93c73f315c565f0aa0d33f"
+    }
+  ],
+  "css": [
+    {
+      "text": "#ff800080",
+      "status": 0,
+      "expectedRecord": "000000000000f03f101010101010e03f0000000000000000101010101010e03f000000000000000000000000000000000000000000000000010000000000000001000000010000000000000000606940"
+    },
+    {
+      "text": "color(prophoto-rgb 1 0.5 none / none)",
+      "status": 0,
+      "expectedRecord": "000000000000f03f000000000000e03f0000000000000000000000000000f03f040000000100000004000000060000000000000000000000090000000400000000000000010000000000000000606940"
+    },
+    {
+      "text": "lab(50 40 -30)",
+      "status": 0,
+      "expectedRecord": "096a2ce3f615d13f054f2c2a2baec73f41eb7a7d1913da3f000000000000f03f000000000000000006000000010000000000000000000000050000000000000001000000010000000000000000606940"
+    },
+    {
+      "text": "LAB(50 40 -30)",
+      "status": 0,
+      "expectedRecord": "096a2ce3f615d13f054f2c2a2baec73f41eb7a7d1913da3f000000000000f03f000000000000000006000000010000000000000000000000050000000000000001000000010000000000000000606940"
+    },
+    { "text": "rgb(1 2)", "status": 2 },
+    { "text": "rgb(1 2 3) extra", "status": 6 },
+    { "text": "color(rec709 1 0 0)", "status": 5 },
+    { "text": "#ggg", "status": 7 }
+  ]
+}

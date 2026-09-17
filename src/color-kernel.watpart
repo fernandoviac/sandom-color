@@ -1,0 +1,2318 @@
+;; Color conversion kernel (docs/specifications/color-and-image-data.md).
+;;
+;; The production scalar color kernel. Self-contained f64 transcendentals
+;; (log2/exp2/pow/exp/log/cbrt via range reduction + series + Newton) keep
+;; observable color arithmetic inside maintained WebAssembly.
+;;
+;; This file is a module component. Embeddable consumers compose it after
+;; color-abi.watpart and provide their own $COLOR_BASE global; color.wat
+;; supplies the same pair with $COLOR_BASE zero.
+;;
+;; Memory map relative to $COLOR_BASE (all f64, little-endian):
+;;   0    .. 1151 : 16 conversion matrices, row-major 3x3, 72 bytes each.
+;;                  Indices 0..9 are RGB/XYZ pairs, 10..11 are Bradford
+;;                  adaptation, and 12..15 are the fixed Oklab transforms.
+;;   1152 .. 1175 : D50 white point XYZ (x, y, z).
+;;   2048 .. 2071 : VEC — the three-component in/out buffer.
+;;   2112+        : internal scratch vectors.
+
+  ;; Scratch offsets.
+  (func $VEC (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2048)))
+  (func $TMP (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2112)))
+  (func $OKLAB (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2176)))
+  (func $CUR (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2240)))
+  (func $CAND (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2304)))
+  (func $CLIP (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2368)))
+  (func $CLIPOK (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2432)))
+
+  ;; ------------------------------------------------------------------
+  ;; Bounded uniform palettes and RGBA8 indexing.
+  ;; ------------------------------------------------------------------
+
+  (func $color_memory_span (param $ptr i32) (param $length i32) (result i32)
+    (i64.le_u
+      (i64.add (i64.extend_i32_u (local.get $ptr)) (i64.extend_i32_u (local.get $length)))
+      (i64.shl (i64.extend_i32_u (memory.size)) (i64.const 16))))
+  (func $color_memory_overlap
+    (param $a i32) (param $aLength i32) (param $b i32) (param $bLength i32) (result i32)
+    (i32.and
+      (i32.ne (local.get $aLength) (i32.const 0))
+      (i32.and
+        (i32.ne (local.get $bLength) (i32.const 0))
+        (i32.and
+          (i64.lt_u
+            (i64.extend_i32_u (local.get $a))
+            (i64.add (i64.extend_i32_u (local.get $b)) (i64.extend_i32_u (local.get $bLength))))
+          (i64.lt_u
+            (i64.extend_i32_u (local.get $b))
+            (i64.add (i64.extend_i32_u (local.get $a)) (i64.extend_i32_u (local.get $aLength))))))))
+
+  ;; Validate the input fields and return the derived entry count. Zero is the
+  ;; error sentinel; every valid cube contains at least eight entries.
+  (func $color_palette_validate (param $record i32) (param $requireEntries i32) (result i32)
+    (local $red i32) (local $green i32) (local $blue i32)
+    (local $transparent i32) (local $entries i64)
+    (if (i32.or (i32.and (local.get $record) (i32.const 3))
+        (i32.eqz (call $color_memory_span (local.get $record) (global.get $COLOR_PALETTE_SIZE))))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 0)))))
+    (local.set $red
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_RED_LEVELS))))
+    (local.set $green
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_GREEN_LEVELS))))
+    (local.set $blue
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_BLUE_LEVELS))))
+    (if (i32.lt_u (local.get $red) (i32.const 2))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_LEVELS) (global.get $COLOR_PALETTE_RED_LEVELS)))))
+    (if (i32.lt_u (local.get $green) (i32.const 2))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_LEVELS) (global.get $COLOR_PALETTE_GREEN_LEVELS)))))
+    (if (i32.lt_u (local.get $blue) (i32.const 2))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_LEVELS) (global.get $COLOR_PALETTE_BLUE_LEVELS)))))
+    (local.set $transparent
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_TRANSPARENT))))
+    (local.set $entries
+      (i64.add
+        (i64.mul
+          (i64.mul (i64.extend_i32_u (local.get $red)) (i64.extend_i32_u (local.get $green)))
+          (i64.extend_i32_u (local.get $blue)))
+        (i64.extend_i32_u (i32.ne (local.get $transparent) (global.get $COLOR_PALETTE_TRANSPARENT_NONE)))))
+    (if (i64.gt_u (local.get $entries) (i64.const 256))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_LEVELS) (global.get $COLOR_PALETTE_ENTRIES)))))
+    (if (i32.and
+        (i32.ne (local.get $transparent) (global.get $COLOR_PALETTE_TRANSPARENT_NONE))
+        (i32.ge_u (local.get $transparent) (i32.wrap_i64 (local.get $entries))))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_RECORD) (global.get $COLOR_PALETTE_TRANSPARENT)))))
+    (if (i32.and (local.get $requireEntries)
+        (i32.ne
+          (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_ENTRIES)))
+          (i32.wrap_i64 (local.get $entries))))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_RECORD) (global.get $COLOR_PALETTE_ENTRIES)))))
+    (i32.wrap_i64 (local.get $entries)))
+
+  (func $color_palette_uniform (export "color_palette_uniform") (param $record i32) (param $palette i32) (param $capacity i32) (result i32)
+    (local $entries i32) (local $needed i32) (local $transparent i32)
+    (local $redLevels i32) (local $greenLevels i32) (local $blueLevels i32)
+    (local $index i32) (local $ordinal i32) (local $red i32) (local $green i32) (local $blue i32)
+    (local $base i32)
+    (call $color_begin)
+    (local.set $entries (call $color_palette_validate (local.get $record) (i32.const 0)))
+    (if (i32.eqz (local.get $entries)) (then (return (i32.const 0))))
+    (local.set $needed (i32.mul (local.get $entries) (i32.const 3)))
+    (if (i32.lt_u (local.get $capacity) (local.get $needed))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 2)))))
+    (if (i32.eqz (call $color_memory_span (local.get $palette) (local.get $needed)))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 1)))))
+    (if (call $color_memory_overlap
+        (local.get $record) (global.get $COLOR_PALETTE_SIZE)
+        (local.get $palette) (local.get $needed))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 1)))))
+    (local.set $redLevels
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_RED_LEVELS))))
+    (local.set $greenLevels
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_GREEN_LEVELS))))
+    (local.set $blueLevels
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_BLUE_LEVELS))))
+    (local.set $transparent
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_TRANSPARENT))))
+    (block $done
+      (loop $colors
+        (br_if $done (i32.ge_u (local.get $index) (local.get $entries)))
+        (local.set $base
+          (i32.add (local.get $palette) (i32.mul (local.get $index) (i32.const 3))))
+        (if (i32.eq (local.get $index) (local.get $transparent))
+          (then
+            (i32.store8 (local.get $base) (i32.const 0))
+            (i32.store8 offset=1 (local.get $base) (i32.const 0))
+            (i32.store8 offset=2 (local.get $base) (i32.const 0)))
+          (else
+            (local.set $ordinal
+              (i32.sub (local.get $index)
+                (i32.and
+                  (i32.ne (local.get $transparent) (global.get $COLOR_PALETTE_TRANSPARENT_NONE))
+                  (i32.gt_u (local.get $index) (local.get $transparent)))))
+            (local.set $red
+              (i32.div_u (local.get $ordinal)
+                (i32.mul (local.get $greenLevels) (local.get $blueLevels))))
+            (local.set $green
+              (i32.div_u
+                (i32.rem_u (local.get $ordinal)
+                  (i32.mul (local.get $greenLevels) (local.get $blueLevels)))
+                (local.get $blueLevels)))
+            (local.set $blue (i32.rem_u (local.get $ordinal) (local.get $blueLevels)))
+            (i32.store8 (local.get $base)
+              (i32.div_u (i32.mul (local.get $red) (i32.const 255))
+                (i32.sub (local.get $redLevels) (i32.const 1))))
+            (i32.store8 offset=1 (local.get $base)
+              (i32.div_u (i32.mul (local.get $green) (i32.const 255))
+                (i32.sub (local.get $greenLevels) (i32.const 1))))
+            (i32.store8 offset=2 (local.get $base)
+              (i32.div_u (i32.mul (local.get $blue) (i32.const 255))
+                (i32.sub (local.get $blueLevels) (i32.const 1))))))
+        (local.set $index (i32.add (local.get $index) (i32.const 1)))
+        (br $colors)))
+    (i32.store (i32.add (local.get $record) (global.get $COLOR_PALETTE_ENTRIES))
+      (local.get $entries))
+    (i32.const 1))
+
+  (func $color_index_palette (export "color_index_palette")
+    (param $record i32) (param $rgba i32) (param $rgbaLength i32)
+    (param $threshold i32) (param $indices i32) (param $indexCapacity i32) (result i32)
+    (local $entries i32) (local $pixels i32) (local $transparent i32)
+    (local $redLevels i32) (local $greenLevels i32) (local $blueLevels i32)
+    (local $pixel i32) (local $source i32) (local $red i32) (local $green i32) (local $blue i32)
+    (local $ordinal i32) (local $index i32)
+    (call $color_begin)
+    (local.set $entries (call $color_palette_validate (local.get $record) (i32.const 1)))
+    (if (i32.eqz (local.get $entries)) (then (return (i32.const 0))))
+    (local.set $transparent
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_TRANSPARENT))))
+    (if (i32.or
+        (i32.and
+          (i32.eq (local.get $transparent) (global.get $COLOR_PALETTE_TRANSPARENT_NONE))
+          (i32.ne (local.get $threshold) (i32.const 0)))
+        (i32.and
+          (i32.ne (local.get $transparent) (global.get $COLOR_PALETTE_TRANSPARENT_NONE))
+          (i32.gt_u (local.get $threshold) (i32.const 255))))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_THRESHOLD) (i32.const 3)))))
+    (if (i32.and (local.get $rgbaLength) (i32.const 3))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 2)))))
+    (local.set $pixels (i32.shr_u (local.get $rgbaLength) (i32.const 2)))
+    (if (i32.lt_u (local.get $indexCapacity) (local.get $pixels))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 5)))))
+    (if (i32.eqz (call $color_memory_span (local.get $rgba) (local.get $rgbaLength)))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 1)))))
+    (if (i32.eqz (call $color_memory_span (local.get $indices) (local.get $pixels)))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 4)))))
+    (if (call $color_memory_overlap
+        (local.get $rgba) (local.get $rgbaLength)
+        (local.get $indices) (local.get $pixels))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 4)))))
+    (if (call $color_memory_overlap
+        (local.get $record) (global.get $COLOR_PALETTE_SIZE)
+        (local.get $indices) (local.get $pixels))
+      (then (return (call $color_reject (global.get $COLOR_ERROR_PALETTE_SPAN) (i32.const 4)))))
+    (local.set $redLevels
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_RED_LEVELS))))
+    (local.set $greenLevels
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_GREEN_LEVELS))))
+    (local.set $blueLevels
+      (i32.load (i32.add (local.get $record) (global.get $COLOR_PALETTE_BLUE_LEVELS))))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $pixel) (local.get $pixels)))
+        (local.set $source (i32.add (local.get $rgba) (i32.shl (local.get $pixel) (i32.const 2))))
+        (if (i32.and
+            (i32.ne (local.get $transparent) (global.get $COLOR_PALETTE_TRANSPARENT_NONE))
+            (i32.le_u (i32.load8_u offset=3 (local.get $source)) (local.get $threshold)))
+          (then (local.set $index (local.get $transparent)))
+          (else
+            (local.set $red
+              (i32.div_u
+                (i32.add
+                  (i32.mul (i32.load8_u (local.get $source))
+                    (i32.sub (local.get $redLevels) (i32.const 1)))
+                  (i32.const 127))
+                (i32.const 255)))
+            (local.set $green
+              (i32.div_u
+                (i32.add
+                  (i32.mul (i32.load8_u offset=1 (local.get $source))
+                    (i32.sub (local.get $greenLevels) (i32.const 1)))
+                  (i32.const 127))
+                (i32.const 255)))
+            (local.set $blue
+              (i32.div_u
+                (i32.add
+                  (i32.mul (i32.load8_u offset=2 (local.get $source))
+                    (i32.sub (local.get $blueLevels) (i32.const 1)))
+                  (i32.const 127))
+                (i32.const 255)))
+            (local.set $ordinal
+              (i32.add
+                (i32.mul (local.get $red)
+                  (i32.mul (local.get $greenLevels) (local.get $blueLevels)))
+                (i32.add
+                  (i32.mul (local.get $green) (local.get $blueLevels))
+                  (local.get $blue))))
+            (local.set $index
+              (i32.add (local.get $ordinal)
+                (i32.and
+                  (i32.ne (local.get $transparent) (global.get $COLOR_PALETTE_TRANSPARENT_NONE))
+                  (i32.ge_u (local.get $ordinal) (local.get $transparent)))))))
+        (i32.store8 (i32.add (local.get $indices) (local.get $pixel)) (local.get $index))
+        (local.set $pixel (i32.add (local.get $pixel) (i32.const 1)))
+        (br $next)))
+    (i32.const 1))
+
+  ;; ------------------------------------------------------------------
+  ;; Transcendentals.
+  ;; ------------------------------------------------------------------
+
+  ;; log2(x) for x > 0. Exponent extraction, mantissa reduced to
+  ;; [sqrt(2)/2, sqrt(2)), atanh series in s = (m-1)/(m+1).
+  (func $log2 (param $x f64) (result f64)
+    (local $bits i64)
+    (local $exponent f64)
+    (local $mantissa f64)
+    (local $s f64)
+    (local $s2 f64)
+    (local $series f64)
+    ;; Subnormal input: scale up by 2^54 and compensate.
+    (if (f64.lt (local.get $x) (f64.const 2.2250738585072014e-308))
+      (then
+        (local.set $x (f64.mul (local.get $x) (f64.const 18014398509481984)))
+        (local.set $exponent (f64.const -54)))
+      (else
+        (local.set $exponent (f64.const 0))))
+    (local.set $bits (i64.reinterpret_f64 (local.get $x)))
+    (local.set $exponent
+      (f64.add (local.get $exponent)
+        (f64.convert_i64_s
+          (i64.sub
+            (i64.and (i64.shr_u (local.get $bits) (i64.const 52)) (i64.const 0x7FF))
+            (i64.const 1023)))))
+    (local.set $mantissa
+      (f64.reinterpret_i64
+        (i64.or
+          (i64.and (local.get $bits) (i64.const 0x000FFFFFFFFFFFFF))
+          (i64.const 0x3FF0000000000000))))
+    (if (f64.gt (local.get $mantissa) (f64.const 1.4142135623730951))
+      (then
+        (local.set $mantissa (f64.mul (local.get $mantissa) (f64.const 0.5)))
+        (local.set $exponent (f64.add (local.get $exponent) (f64.const 1)))))
+    (local.set $s
+      (f64.div
+        (f64.sub (local.get $mantissa) (f64.const 1))
+        (f64.add (local.get $mantissa) (f64.const 1))))
+    (local.set $s2 (f64.mul (local.get $s) (local.get $s)))
+    ;; 1 + s2/3 + s2^2/5 + ... + s2^9/19 (Horner).
+    (local.set $series (f64.div (f64.const 1) (f64.const 19)))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 17)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 15)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 13)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 11)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 9)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 7)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 5)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.div (f64.const 1) (f64.const 3)) (f64.mul (local.get $series) (local.get $s2))))
+    (local.set $series (f64.add (f64.const 1) (f64.mul (local.get $series) (local.get $s2))))
+    ;; log2(m) = 2 * s * series / ln(2).
+    (f64.add
+      (local.get $exponent)
+      (f64.mul
+        (f64.mul (f64.mul (f64.const 2) (local.get $s)) (local.get $series))
+        (f64.const 1.4426950408889634))))
+
+  ;; exp2(x). Integer/fraction split, exp Taylor on r*ln(2), exponent
+  ;; reassembly through the bit pattern.
+  (func $exp2 (param $x f64) (result f64)
+    (local $n f64)
+    (local $y f64)
+    (local $sum f64)
+    (local $k f64)
+    (if (f64.le (local.get $x) (f64.const -1022))
+      (then (return (f64.const 0))))
+    (if (f64.ge (local.get $x) (f64.const 1024))
+      (then (return (f64.mul (f64.const 1e308) (f64.const 10)))))
+    (local.set $n (f64.nearest (local.get $x)))
+    (local.set $y
+      (f64.mul
+        (f64.sub (local.get $x) (local.get $n))
+        (f64.const 0.6931471805599453)))
+    ;; exp(y), |y| <= 0.347: Horner over 1 + y(1 + y/2(1 + y/3(...)))
+    (local.set $sum (f64.const 1))
+    (local.set $k (f64.const 13))
+    (block $done
+      (loop $terms
+        (local.set $sum
+          (f64.add (f64.const 1)
+            (f64.mul (local.get $sum) (f64.div (local.get $y) (local.get $k)))))
+        (local.set $k (f64.sub (local.get $k) (f64.const 1)))
+        (br_if $done (f64.lt (local.get $k) (f64.const 1)))
+        (br $terms)))
+    (f64.mul
+      (local.get $sum)
+      (f64.reinterpret_i64
+        (i64.shl
+          (i64.add (i64.trunc_f64_s (local.get $n)) (i64.const 1023))
+          (i64.const 52)))))
+
+  ;; pow(x, y) for x >= 0.
+  (func $pow (param $x f64) (param $y f64) (result f64)
+    (if (f64.le (local.get $x) (f64.const 0))
+      (then (return (f64.const 0))))
+    (call $exp2 (f64.mul (local.get $y) (call $log2 (local.get $x)))))
+
+  (func $exp (param $x f64) (result f64)
+    (call $exp2 (f64.mul (local.get $x) (f64.const 1.4426950408889634))))
+
+  (func $log (param $x f64) (result f64)
+    (f64.mul (call $log2 (local.get $x)) (f64.const 0.6931471805599453)))
+
+  ;; cbrt(x), sign-mirrored. Seed from exp2(log2/3), two Newton rounds.
+  (func $cbrt (param $x f64) (result f64)
+    (local $sign f64)
+    (local $magnitude f64)
+    (local $t f64)
+    (if (f64.eq (local.get $x) (f64.const 0))
+      (then (return (f64.const 0))))
+    (local.set $sign (f64.copysign (f64.const 1) (local.get $x)))
+    (local.set $magnitude (f64.abs (local.get $x)))
+    (local.set $t
+      (call $exp2 (f64.div (call $log2 (local.get $magnitude)) (f64.const 3))))
+    ;; Newton: t = (2t + m/t^2) / 3, twice.
+    (local.set $t
+      (f64.div
+        (f64.add
+          (f64.mul (f64.const 2) (local.get $t))
+          (f64.div (local.get $magnitude) (f64.mul (local.get $t) (local.get $t))))
+        (f64.const 3)))
+    (local.set $t
+      (f64.div
+        (f64.add
+          (f64.mul (f64.const 2) (local.get $t))
+          (f64.div (local.get $magnitude) (f64.mul (local.get $t) (local.get $t))))
+        (f64.const 3)))
+    (f64.mul (local.get $sign) (local.get $t)))
+
+  ;; ------------------------------------------------------------------
+  ;; Transfer functions (CSS Color 4 point-symmetric extension).
+  ;; ------------------------------------------------------------------
+
+  (func $srgb_decode (export "srgb_decode") (param $value f64) (result f64)
+    (local $sign f64)
+    (local $magnitude f64)
+    (local.set $sign (f64.copysign (f64.const 1) (local.get $value)))
+    (local.set $magnitude (f64.abs (local.get $value)))
+    (if (result f64) (f64.le (local.get $magnitude) (f64.const 0.04045))
+      (then (f64.div (local.get $value) (f64.const 12.92)))
+      (else
+        (f64.mul (local.get $sign)
+          (call $pow
+            (f64.div (f64.add (local.get $magnitude) (f64.const 0.055)) (f64.const 1.055))
+            (f64.const 2.4))))))
+
+  (func $srgb_encode (export "srgb_encode") (param $value f64) (result f64)
+    (local $sign f64)
+    (local $magnitude f64)
+    (local.set $sign (f64.copysign (f64.const 1) (local.get $value)))
+    (local.set $magnitude (f64.abs (local.get $value)))
+    (if (result f64) (f64.le (local.get $magnitude) (f64.const 0.0031308))
+      (then (f64.mul (local.get $value) (f64.const 12.92)))
+      (else
+        (f64.mul (local.get $sign)
+          (f64.sub
+            (f64.mul (f64.const 1.055)
+              (call $pow (local.get $magnitude) (f64.div (f64.const 1) (f64.const 2.4))))
+            (f64.const 0.055))))))
+
+  (func $gamma_decode (export "gamma_decode") (param $value f64) (param $exponent f64) (result f64)
+    (f64.mul
+      (f64.copysign (f64.const 1) (local.get $value))
+      (call $pow (f64.abs (local.get $value)) (local.get $exponent))))
+
+  (func $gamma_encode (export "gamma_encode") (param $value f64) (param $exponent f64) (result f64)
+    (f64.mul
+      (f64.copysign (f64.const 1) (local.get $value))
+      (call $pow (f64.abs (local.get $value)) (f64.div (f64.const 1) (local.get $exponent)))))
+
+  ;; Perceptual quantizer, Rec. ITU-R BT.2100. Constants as exact runtime
+  ;; divisions so the kernel and the reference share one construction.
+  (func $pq_signal_to_luminance (export "pq_signal_to_luminance") (param $signal f64) (result f64)
+    (local $power f64)
+    (local $numerator f64)
+    (local.set $power
+      (call $pow
+        (f64.max (local.get $signal) (f64.const 0))
+        (f64.div (f64.const 32) (f64.const 2523))))
+    (local.set $numerator
+      (f64.max (f64.sub (local.get $power) (f64.div (f64.const 107) (f64.const 128))) (f64.const 0)))
+    (f64.mul (f64.const 10000)
+      (call $pow
+        (f64.div
+          (local.get $numerator)
+          (f64.sub
+            (f64.div (f64.const 2413) (f64.const 128))
+            (f64.mul (f64.div (f64.const 2392) (f64.const 128)) (local.get $power))))
+        (f64.div (f64.const 8192) (f64.const 1305)))))
+
+  (func $luminance_to_pq_signal (export "luminance_to_pq_signal") (param $luminance f64) (result f64)
+    (local $power f64)
+    (local.set $power
+      (call $pow
+        (f64.div (f64.max (local.get $luminance) (f64.const 0)) (f64.const 10000))
+        (f64.div (f64.const 1305) (f64.const 8192))))
+    (call $pow
+      (f64.div
+        (f64.add
+          (f64.div (f64.const 107) (f64.const 128))
+          (f64.mul (f64.div (f64.const 2413) (f64.const 128)) (local.get $power)))
+        (f64.add (f64.const 1)
+          (f64.mul (f64.div (f64.const 2392) (f64.const 128)) (local.get $power))))
+      (f64.div (f64.const 2523) (f64.const 32))))
+
+  (func $pq_to_working (export "pq_to_working") (param $signal f64) (result f64)
+    (f64.div (call $pq_signal_to_luminance (local.get $signal)) (f64.const 203)))
+
+  (func $working_to_pq (export "working_to_pq") (param $value f64) (result f64)
+    (call $luminance_to_pq_signal (f64.mul (local.get $value) (f64.const 203))))
+
+  ;; Hybrid log-gamma, Rec. ITU-R BT.2100.
+  (func $hlg_b (result f64)
+    (f64.sub (f64.const 1) (f64.mul (f64.const 4) (f64.const 0.17883277))))
+
+  (func $hlg_c (result f64)
+    (f64.sub (f64.const 0.5)
+      (f64.mul (f64.const 0.17883277)
+        (call $log (f64.mul (f64.const 4) (f64.const 0.17883277))))))
+
+  (func $hlg_signal_to_scene (export "hlg_signal_to_scene") (param $signal f64) (result f64)
+    (local $clamped f64)
+    (local.set $clamped (f64.max (local.get $signal) (f64.const 0)))
+    (if (result f64) (f64.le (local.get $clamped) (f64.const 0.5))
+      (then (f64.div (f64.mul (local.get $clamped) (local.get $clamped)) (f64.const 3)))
+      (else
+        (f64.div
+          (f64.add
+            (call $exp
+              (f64.div (f64.sub (local.get $clamped) (call $hlg_c)) (f64.const 0.17883277)))
+            (call $hlg_b))
+          (f64.const 12)))))
+
+  (func $scene_to_hlg_signal (export "scene_to_hlg_signal") (param $sceneLight f64) (result f64)
+    (local $clamped f64)
+    (local.set $clamped (f64.max (local.get $sceneLight) (f64.const 0)))
+    (if (result f64) (f64.le (local.get $clamped) (f64.div (f64.const 1) (f64.const 12)))
+      (then (f64.sqrt (f64.mul (f64.const 3) (local.get $clamped))))
+      (else
+        (f64.add
+          (f64.mul (f64.const 0.17883277)
+            (call $log
+              (f64.sub (f64.mul (f64.const 12) (local.get $clamped)) (call $hlg_b))))
+          (call $hlg_c)))))
+
+  ;; ------------------------------------------------------------------
+  ;; Vector helpers on memory offsets.
+  ;; ------------------------------------------------------------------
+
+  (func $load0 (param $offset i32) (result f64) (f64.load (local.get $offset)))
+  (func $load1 (param $offset i32) (result f64) (f64.load (i32.add (local.get $offset) (i32.const 8))))
+  (func $load2 (param $offset i32) (result f64) (f64.load (i32.add (local.get $offset) (i32.const 16))))
+
+  (func $store_vec (param $offset i32) (param $v0 f64) (param $v1 f64) (param $v2 f64)
+    (f64.store (local.get $offset) (local.get $v0))
+    (f64.store (i32.add (local.get $offset) (i32.const 8)) (local.get $v1))
+    (f64.store (i32.add (local.get $offset) (i32.const 16)) (local.get $v2)))
+
+  (func $copy_vec (param $source i32) (param $destination i32)
+    (call $store_vec (local.get $destination)
+      (call $load0 (local.get $source))
+      (call $load1 (local.get $source))
+      (call $load2 (local.get $source))))
+
+  ;; destination = matrix[index] * source. Reads all inputs before any
+  ;; write, so source may equal destination.
+  (func $apply (param $index i32) (param $source i32) (param $destination i32)
+    (local $base i32)
+    (local $v0 f64)
+    (local $v1 f64)
+    (local $v2 f64)
+    (local $r0 f64)
+    (local $r1 f64)
+    (local $r2 f64)
+    (local.set $base (i32.add (global.get $COLOR_BASE) (i32.mul (local.get $index) (i32.const 72))))
+    (local.set $v0 (call $load0 (local.get $source)))
+    (local.set $v1 (call $load1 (local.get $source)))
+    (local.set $v2 (call $load2 (local.get $source)))
+    (local.set $r0
+      (f64.add
+        (f64.add
+          (f64.mul (f64.load (local.get $base)) (local.get $v0))
+          (f64.mul (f64.load (i32.add (local.get $base) (i32.const 8))) (local.get $v1)))
+        (f64.mul (f64.load (i32.add (local.get $base) (i32.const 16))) (local.get $v2))))
+    (local.set $r1
+      (f64.add
+        (f64.add
+          (f64.mul (f64.load (i32.add (local.get $base) (i32.const 24))) (local.get $v0))
+          (f64.mul (f64.load (i32.add (local.get $base) (i32.const 32))) (local.get $v1)))
+        (f64.mul (f64.load (i32.add (local.get $base) (i32.const 40))) (local.get $v2))))
+    (local.set $r2
+      (f64.add
+        (f64.add
+          (f64.mul (f64.load (i32.add (local.get $base) (i32.const 48))) (local.get $v0))
+          (f64.mul (f64.load (i32.add (local.get $base) (i32.const 56))) (local.get $v1)))
+        (f64.mul (f64.load (i32.add (local.get $base) (i32.const 64))) (local.get $v2))))
+    (call $store_vec (local.get $destination) (local.get $r0) (local.get $r1) (local.get $r2)))
+
+  (func $apply_matrix (export "apply_matrix") (param $index i32)
+    (call $apply (local.get $index) (call $VEC) (call $VEC)))
+  ;; Copy one WAT-owned 3x3 matrix to caller memory.
+  (func (export "color_matrix_read") (param $index i32) (param $destination i32) (param $capacity i32) (result i32)
+    (if (i32.or (i32.ge_u (local.get $index) (i32.const 16)) (i32.lt_u (local.get $capacity) (i32.const 72)))
+      (then (return (i32.const 0))))
+    (memory.copy (local.get $destination)
+      (i32.add (global.get $COLOR_BASE) (i32.mul (local.get $index) (i32.const 72)))
+      (i32.const 72))
+    (i32.const 1))
+  ;; Decode a tagged RGB value in VEC and convert it to linear Rec.2020.
+  ;; Missing components become zero before transfer decoding. PQ and HLG are
+  ;; defined on Rec.2020 and therefore enter the working space directly.
+  (func $color_convert_tagged_to_working (export "color_convert_tagged_to_working")
+    (param $primaries i32) (param $transfer i32) (param $gamma f64)
+    (param $missing i32) (result i32)
+    (local $channel i32) (local $value f64)
+    (if (i32.or
+      (i32.or (i32.gt_u (local.get $primaries) (i32.const 6))
+        (i32.gt_u (local.get $transfer) (i32.const 6)))
+      (i32.or (i32.gt_u (local.get $missing) (i32.const 7))
+        (i32.and (i32.eq (local.get $transfer) (i32.const 2))
+          (i32.or (f64.ne (local.get $gamma) (local.get $gamma))
+            (i32.or (f64.le (local.get $gamma) (f64.const 0))
+              (f64.ge (local.get $gamma) (f64.const inf)))))))
+      (then (return (i32.const 0))))
+    (loop $components
+      (if (i32.and (local.get $missing) (i32.shl (i32.const 1) (local.get $channel)))
+        (then
+          (f64.store
+            (i32.add (call $VEC) (i32.mul (local.get $channel) (i32.const 8)))
+            (f64.const 0))))
+      (local.set $channel (i32.add (local.get $channel) (i32.const 1)))
+      (br_if $components (i32.lt_u (local.get $channel) (i32.const 3))))
+    (if (i32.eq (local.get $transfer) (i32.const 4))
+      (then (call $hlg_rgb_to_working) (return (i32.const 1))))
+    (if (i32.eq (local.get $transfer) (i32.const 3))
+      (then
+        (f64.store (call $VEC) (call $pq_to_working (call $load0 (call $VEC))))
+        (f64.store offset=8 (call $VEC) (call $pq_to_working (call $load1 (call $VEC))))
+        (f64.store offset=16 (call $VEC) (call $pq_to_working (call $load2 (call $VEC))))
+        (return (i32.const 1))))
+    (local.set $channel (i32.const 0))
+    (loop $decode
+      (local.set $value
+        (f64.load (i32.add (call $VEC) (i32.mul (local.get $channel) (i32.const 8)))))
+      (if (i32.eqz (local.get $transfer))
+        (then (local.set $value (call $srgb_decode (local.get $value)))))
+      (if (i32.eq (local.get $transfer) (i32.const 2))
+        (then (local.set $value (call $gamma_decode (local.get $value) (local.get $gamma)))))
+      (if (i32.eq (local.get $transfer) (i32.const 5))
+        (then (local.set $value (call $rec2020_decode (local.get $value)))))
+      (if (i32.eq (local.get $transfer) (i32.const 6))
+        (then (local.set $value (call $prophoto_decode (local.get $value)))))
+      (f64.store
+        (i32.add (call $VEC) (i32.mul (local.get $channel) (i32.const 8)))
+        (local.get $value))
+      (local.set $channel (i32.add (local.get $channel) (i32.const 1)))
+      (br_if $decode (i32.lt_u (local.get $channel) (i32.const 3))))
+    (if (i32.ne (local.get $primaries) (i32.const 2))
+      (then
+        (if (i32.lt_u (local.get $primaries) (i32.const 5))
+          (then (call $apply_matrix (i32.mul (local.get $primaries) (i32.const 2)))))
+        (if (i32.or (i32.eq (local.get $primaries) (i32.const 4))
+          (i32.eq (local.get $primaries) (i32.const 5)))
+          (then (call $apply_matrix (i32.const 10))))
+        (call $apply_matrix (i32.const 5))))
+    (i32.const 1))
+
+  ;; The only accepted working encodings are extended encoded sRGB and linear
+  ;; Rec.2020. Returning -1 rejects every other primaries/transfer pair.
+  (func (export "color_working_code")
+    (param $primaries i32) (param $transfer i32) (result i32)
+    (if (result i32)
+      (i32.and (i32.eqz (local.get $primaries)) (i32.eqz (local.get $transfer)))
+      (then (i32.const 0))
+      (else
+        (if (result i32)
+          (i32.and (i32.eq (local.get $primaries) (i32.const 2))
+            (i32.eq (local.get $transfer) (i32.const 1)))
+          (then (i32.const 1))
+          (else (i32.const -1))))))
+
+  ;; Tagged input in VEC to the standard working encoding. The direct sRGB
+  ;; route preserves authored finite values bit for bit.
+  (func $color_convert_tagged_to_standard (export "color_convert_tagged_to_standard")
+    (param $primaries i32) (param $transfer i32) (param $gamma f64)
+    (param $missing i32) (result i32)
+    (if (i32.and (i32.eqz (local.get $primaries)) (i32.eqz (local.get $transfer)))
+      (then
+        (if (i32.gt_u (local.get $missing) (i32.const 7))
+          (then (return (i32.const 0))))
+        (if (i32.and (local.get $missing) (i32.const 1))
+          (then (f64.store (call $VEC) (f64.const 0))))
+        (if (i32.and (local.get $missing) (i32.const 2))
+          (then (f64.store offset=8 (call $VEC) (f64.const 0))))
+        (if (i32.and (local.get $missing) (i32.const 4))
+          (then (f64.store offset=16 (call $VEC) (f64.const 0))))
+        (return (i32.const 1))))
+    (if (i32.eqz
+      (call $color_convert_tagged_to_working
+        (local.get $primaries) (local.get $transfer) (local.get $gamma)
+        (local.get $missing)))
+      (then (return (i32.const 0))))
+    (call $apply_matrix (i32.const 4))
+    (call $apply_matrix (i32.const 1))
+    (f64.store (call $VEC) (call $srgb_encode (call $load0 (call $VEC))))
+    (f64.store offset=8 (call $VEC) (call $srgb_encode (call $load1 (call $VEC))))
+    (f64.store offset=16 (call $VEC) (call $srgb_encode (call $load2 (call $VEC))))
+    (i32.const 1))
+
+  ;; XYZ D65 -> OKLab at offsets (matrix 12, cbrt, matrix 14).
+  (func $xyz_to_oklab_at (param $source i32) (param $destination i32)
+    (call $apply (i32.const 12) (local.get $source) (local.get $destination))
+    (call $store_vec (local.get $destination)
+      (call $cbrt (call $load0 (local.get $destination)))
+      (call $cbrt (call $load1 (local.get $destination)))
+      (call $cbrt (call $load2 (local.get $destination))))
+    (call $apply (i32.const 14) (local.get $destination) (local.get $destination)))
+
+  ;; OKLab -> XYZ D65 at offsets (matrix 15, cube, matrix 13).
+  (func $oklab_to_xyz_at (param $source i32) (param $destination i32)
+    (local $v0 f64)
+    (local $v1 f64)
+    (local $v2 f64)
+    (call $apply (i32.const 15) (local.get $source) (local.get $destination))
+    (local.set $v0 (call $load0 (local.get $destination)))
+    (local.set $v1 (call $load1 (local.get $destination)))
+    (local.set $v2 (call $load2 (local.get $destination)))
+    (call $store_vec (local.get $destination)
+      (f64.mul (f64.mul (local.get $v0) (local.get $v0)) (local.get $v0))
+      (f64.mul (f64.mul (local.get $v1) (local.get $v1)) (local.get $v1))
+      (f64.mul (f64.mul (local.get $v2) (local.get $v2)) (local.get $v2)))
+    (call $apply (i32.const 13) (local.get $destination) (local.get $destination)))
+
+  (func $xyz_d65_to_oklab (export "xyz_d65_to_oklab")
+    (call $xyz_to_oklab_at (call $VEC) (call $VEC)))
+
+  (func $oklab_to_xyz_d65 (export "oklab_to_xyz_d65")
+    (call $oklab_to_xyz_at (call $VEC) (call $VEC)))
+
+  ;; Lab (D50 anchored). Epsilon 216/24389 and kappa 24389/27 as runtime
+  ;; divisions.
+  (func $lab_f_inverse (param $f f64) (result f64)
+    (local $cubed f64)
+    (local.set $cubed (f64.mul (f64.mul (local.get $f) (local.get $f)) (local.get $f)))
+    (if (result f64) (f64.gt (local.get $cubed) (f64.div (f64.const 216) (f64.const 24389)))
+      (then (local.get $cubed))
+      (else
+        (f64.div
+          (f64.sub (f64.mul (f64.const 116) (local.get $f)) (f64.const 16))
+          (f64.div (f64.const 24389) (f64.const 27))))))
+
+  (func $lab_f (param $t f64) (result f64)
+    (if (result f64) (f64.gt (local.get $t) (f64.div (f64.const 216) (f64.const 24389)))
+      (then (call $cbrt (local.get $t)))
+      (else
+        (f64.div
+          (f64.add
+            (f64.mul (f64.div (f64.const 24389) (f64.const 27)) (local.get $t))
+            (f64.const 16))
+          (f64.const 116)))))
+
+  (func $lab_to_xyz_d50 (export "lab_to_xyz_d50")
+    (local $lightness f64)
+    (local $fy f64)
+    (local $y f64)
+    (local.set $lightness (call $load0 (call $VEC)))
+    (local.set $fy (f64.div (f64.add (local.get $lightness) (f64.const 16)) (f64.const 116)))
+    (if (f64.gt (local.get $lightness)
+          (f64.mul (f64.div (f64.const 24389) (f64.const 27)) (f64.div (f64.const 216) (f64.const 24389))))
+      (then
+        (local.set $y (f64.mul (f64.mul (local.get $fy) (local.get $fy)) (local.get $fy))))
+      (else
+        (local.set $y (f64.div (local.get $lightness) (f64.div (f64.const 24389) (f64.const 27))))))
+    (call $store_vec (call $VEC)
+      (f64.mul
+        (call $lab_f_inverse
+          (f64.add (local.get $fy) (f64.div (call $load1 (call $VEC)) (f64.const 500))))
+        (f64.load (i32.add (global.get $COLOR_BASE) (i32.const 1152))))
+      (local.get $y)
+      (f64.mul
+        (call $lab_f_inverse
+          (f64.sub (local.get $fy) (f64.div (call $load2 (call $VEC)) (f64.const 200))))
+        (f64.load (i32.add (global.get $COLOR_BASE) (i32.const 1168))))))
+
+  (func $xyz_d50_to_lab (export "xyz_d50_to_lab")
+    (local $fx f64)
+    (local $fy f64)
+    (local $fz f64)
+    (local.set $fx (call $lab_f (f64.div (call $load0 (call $VEC)) (f64.load (i32.add (global.get $COLOR_BASE) (i32.const 1152))))))
+    (local.set $fy (call $lab_f (f64.div (call $load1 (call $VEC)) (f64.load (i32.add (global.get $COLOR_BASE) (i32.const 1160))))))
+    (local.set $fz (call $lab_f (f64.div (call $load2 (call $VEC)) (f64.load (i32.add (global.get $COLOR_BASE) (i32.const 1168))))))
+    (call $store_vec (call $VEC)
+      (f64.sub (f64.mul (f64.const 116) (local.get $fy)) (f64.const 16))
+      (f64.mul (f64.const 500) (f64.sub (local.get $fx) (local.get $fy)))
+      (f64.mul (f64.const 200) (f64.sub (local.get $fy) (local.get $fz)))))
+
+  ;; HLG RGB signal -> working scale (opto-optical transform, 1000-candela
+  ;; reference display, system gamma 1.2, 203-candela reference white).
+  (func $hlg_rgb_to_working (export "hlg_rgb_to_working")
+    (local $scene0 f64)
+    (local $scene1 f64)
+    (local $scene2 f64)
+    (local $luminance f64)
+    (local $gain f64)
+    (local.set $scene0 (call $hlg_signal_to_scene (call $load0 (call $VEC))))
+    (local.set $scene1 (call $hlg_signal_to_scene (call $load1 (call $VEC))))
+    (local.set $scene2 (call $hlg_signal_to_scene (call $load2 (call $VEC))))
+    (local.set $luminance
+      (f64.add
+        (f64.add
+          (f64.mul (f64.const 0.2627) (local.get $scene0))
+          (f64.mul (f64.const 0.678) (local.get $scene1)))
+        (f64.mul (f64.const 0.0593) (local.get $scene2))))
+    (if (f64.le (local.get $luminance) (f64.const 0))
+      (then (local.set $gain (f64.const 0)))
+      (else
+        (local.set $gain
+          (f64.div
+            (f64.mul (f64.const 1000)
+              (call $pow (local.get $luminance) (f64.sub (f64.const 1.2) (f64.const 1))))
+            (f64.const 203)))))
+    (call $store_vec (call $VEC)
+      (f64.mul (local.get $scene0) (local.get $gain))
+      (f64.mul (local.get $scene1) (local.get $gain))
+      (f64.mul (local.get $scene2) (local.get $gain))))
+
+  ;; ------------------------------------------------------------------
+  ;; Tone map: Rec. ITU-R BT.2390 EETF on the largest channel in the PQ
+  ;; domain, one gain for all three channels. Working scale in VEC.
+  ;; ------------------------------------------------------------------
+  (func $tone_map_bt2390 (export "tone_map_bt2390")
+    (param $sourcePeakLuminance f64) (param $targetPeakLuminance f64)
+    (local $sourcePeakSignal f64)
+    (local $maxChannel f64)
+    (local $normalized f64)
+    (local $maxNormalized f64)
+    (local $kneeStart f64)
+    (local $t f64)
+    (local $t2 f64)
+    (local $t3 f64)
+    (local $mapped f64)
+    (local $gain f64)
+    (local.set $sourcePeakSignal (call $luminance_to_pq_signal (local.get $sourcePeakLuminance)))
+    (local.set $maxChannel
+      (f64.max
+        (f64.max (call $load0 (call $VEC)) (call $load1 (call $VEC)))
+        (call $load2 (call $VEC))))
+    (if (f64.le (local.get $maxChannel) (f64.const 0))
+      (then
+        (call $store_vec (call $VEC) (f64.const 0) (f64.const 0) (f64.const 0))
+        (return)))
+    (local.set $normalized
+      (f64.div
+        (call $luminance_to_pq_signal (f64.mul (local.get $maxChannel) (f64.const 203)))
+        (local.get $sourcePeakSignal)))
+    (local.set $maxNormalized
+      (f64.div
+        (call $luminance_to_pq_signal (local.get $targetPeakLuminance))
+        (local.get $sourcePeakSignal)))
+    (local.set $kneeStart
+      (f64.sub (f64.mul (f64.const 1.5) (local.get $maxNormalized)) (f64.const 0.5)))
+    (if (f64.lt (local.get $normalized) (local.get $kneeStart))
+      (then (local.set $mapped (local.get $normalized)))
+      (else
+        (local.set $t
+          (f64.div
+            (f64.sub (local.get $normalized) (local.get $kneeStart))
+            (f64.sub (f64.const 1) (local.get $kneeStart))))
+        (local.set $t2 (f64.mul (local.get $t) (local.get $t)))
+        (local.set $t3 (f64.mul (local.get $t2) (local.get $t)))
+        (local.set $mapped
+          (f64.add
+            (f64.add
+              (f64.mul
+                (f64.add
+                  (f64.sub (f64.mul (f64.const 2) (local.get $t3))
+                    (f64.mul (f64.const 3) (local.get $t2)))
+                  (f64.const 1))
+                (local.get $kneeStart))
+              (f64.mul
+                (f64.add
+                  (f64.sub (local.get $t3) (f64.mul (f64.const 2) (local.get $t2)))
+                  (local.get $t))
+                (f64.sub (f64.const 1) (local.get $kneeStart))))
+            (f64.mul
+              (f64.add
+                (f64.mul (f64.const -2) (local.get $t3))
+                (f64.mul (f64.const 3) (local.get $t2)))
+              (local.get $maxNormalized))))))
+    (local.set $gain
+      (f64.div
+        (f64.div
+          (call $pq_signal_to_luminance
+            (f64.mul (local.get $mapped) (local.get $sourcePeakSignal)))
+          (f64.const 203))
+        (local.get $maxChannel)))
+    (call $store_vec (call $VEC)
+      (f64.mul (call $load0 (call $VEC)) (local.get $gain))
+      (f64.mul (call $load1 (call $VEC)) (local.get $gain))
+      (f64.mul (call $load2 (call $VEC)) (local.get $gain))))
+
+  ;; ------------------------------------------------------------------
+  ;; Gamut map: CSS Color 4 OKLCh chroma reduction. VEC holds working
+  ;; RGB in, destination linear RGB out. Chroma scales through the
+  ;; rectangular a/b components, so no trigonometry is needed.
+  ;; ------------------------------------------------------------------
+
+  (func $in_gamut (param $offset i32) (result i32)
+    (local $v f64)
+    (local.set $v (call $load0 (local.get $offset)))
+    (if (i32.or (f64.lt (local.get $v) (f64.const 0)) (f64.gt (local.get $v) (f64.const 1)))
+      (then (return (i32.const 0))))
+    (local.set $v (call $load1 (local.get $offset)))
+    (if (i32.or (f64.lt (local.get $v) (f64.const 0)) (f64.gt (local.get $v) (f64.const 1)))
+      (then (return (i32.const 0))))
+    (local.set $v (call $load2 (local.get $offset)))
+    (if (i32.or (f64.lt (local.get $v) (f64.const 0)) (f64.gt (local.get $v) (f64.const 1)))
+      (then (return (i32.const 0))))
+    (i32.const 1))
+
+  (func $clip01 (param $source i32) (param $destination i32)
+    (call $store_vec (local.get $destination)
+      (f64.min (f64.max (call $load0 (local.get $source)) (f64.const 0)) (f64.const 1))
+      (f64.min (f64.max (call $load1 (local.get $source)) (f64.const 0)) (f64.const 1))
+      (f64.min (f64.max (call $load2 (local.get $source)) (f64.const 0)) (f64.const 1))))
+
+  ;; OKLab at $source -> destination linear RGB at $destination.
+  (func $oklab_to_dest (param $source i32) (param $destination i32)
+    (param $xyzToDest i32) (param $destIsD50 i32)
+    (call $oklab_to_xyz_at (local.get $source) (local.get $destination))
+    (if (local.get $destIsD50)
+      (then (call $apply (i32.const 11) (local.get $destination) (local.get $destination))))
+    (call $apply (local.get $xyzToDest) (local.get $destination) (local.get $destination)))
+
+  (func $gamut_map_css_color_4 (export "gamut_map_css_color_4")
+    (param $xyzToDest i32) (param $destToXyz i32) (param $destIsD50 i32)
+    (local $lightness f64)
+    (local $a0 f64)
+    (local $b0 f64)
+    (local $chroma f64)
+    (local $lowChroma f64)
+    (local $highChroma f64)
+    (local $midChroma f64)
+    (local $scale f64)
+    (local $d0 f64)
+    (local $d1 f64)
+    (local $d2 f64)
+    ;; Working RGB is Rec.2020: preserve identity at the gamut boundary.
+    ;; A matrix round trip can push an exact 1 above 1 and spuriously map it.
+    ;; Ordered bounds leave NaNs on the established propagation path.
+    (if (i32.and
+          (i32.and (i32.eq (local.get $xyzToDest) (i32.const 5))
+                   (i32.eq (local.get $destToXyz) (i32.const 4)))
+          (i32.eqz (local.get $destIsD50)))
+      (then
+        (if (i32.and
+              (i32.and
+                (f64.ge (call $load0 (call $VEC)) (f64.const 0))
+                (f64.le (call $load0 (call $VEC)) (f64.const 1)))
+              (i32.and
+                (i32.and
+                  (f64.ge (call $load1 (call $VEC)) (f64.const 0))
+                  (f64.le (call $load1 (call $VEC)) (f64.const 1)))
+                (i32.and
+                  (f64.ge (call $load2 (call $VEC)) (f64.const 0))
+                  (f64.le (call $load2 (call $VEC)) (f64.const 1)))))
+          (then (return)))))
+    ;; Direct conversion first: working -> XYZ -> (D50) -> destination.
+    (call $apply (i32.const 4) (call $VEC) (call $TMP))
+    (if (local.get $destIsD50)
+      (then (call $apply (i32.const 11) (call $TMP) (call $TMP))))
+    (call $apply (local.get $xyzToDest) (call $TMP) (call $CAND))
+    (if (call $in_gamut (call $CAND))
+      (then
+        (call $copy_vec (call $CAND) (call $VEC))
+        (return)))
+    ;; OKLab of the working color.
+    (call $apply (i32.const 4) (call $VEC) (call $TMP))
+    (call $xyz_to_oklab_at (call $TMP) (call $OKLAB))
+    (local.set $lightness (call $load0 (call $OKLAB)))
+    (local.set $a0 (call $load1 (call $OKLAB)))
+    (local.set $b0 (call $load2 (call $OKLAB)))
+    (if (f64.ge (local.get $lightness) (f64.const 1))
+      (then
+        (call $store_vec (call $VEC) (f64.const 1) (f64.const 1) (f64.const 1))
+        (return)))
+    (if (f64.le (local.get $lightness) (f64.const 0))
+      (then
+        (call $store_vec (call $VEC) (f64.const 0) (f64.const 0) (f64.const 0))
+        (return)))
+    (local.set $chroma
+      (f64.sqrt
+        (f64.add
+          (f64.mul (local.get $a0) (local.get $a0))
+          (f64.mul (local.get $b0) (local.get $b0)))))
+    (local.set $lowChroma (f64.const 0))
+    (local.set $highChroma (local.get $chroma))
+    (call $copy_vec (call $OKLAB) (call $CUR))
+    (block $done
+      (loop $search
+        (br_if $done
+          (i32.or
+            (f64.le (f64.sub (local.get $highChroma) (local.get $lowChroma)) (f64.const 0.0001))
+            (f64.le (local.get $chroma) (f64.const 0))))
+        (local.set $midChroma
+          (f64.mul (f64.add (local.get $lowChroma) (local.get $highChroma)) (f64.const 0.5)))
+        (local.set $scale (f64.div (local.get $midChroma) (local.get $chroma)))
+        (call $store_vec (call $CUR)
+          (local.get $lightness)
+          (f64.mul (local.get $a0) (local.get $scale))
+          (f64.mul (local.get $b0) (local.get $scale)))
+        (call $oklab_to_dest (call $CUR) (call $CAND)
+          (local.get $xyzToDest) (local.get $destIsD50))
+        (if (call $in_gamut (call $CAND))
+          (then
+            (local.set $lowChroma (local.get $midChroma))
+            (br $search)))
+        ;; Clip, measure the OKLab distance from the clipped candidate.
+        (call $clip01 (call $CAND) (call $CLIP))
+        (call $apply (local.get $destToXyz) (call $CLIP) (call $CLIPOK))
+        (if (local.get $destIsD50)
+          (then (call $apply (i32.const 10) (call $CLIPOK) (call $CLIPOK))))
+        (call $xyz_to_oklab_at (call $CLIPOK) (call $CLIPOK))
+        (local.set $d0 (f64.sub (call $load0 (call $CLIPOK)) (call $load0 (call $CUR))))
+        (local.set $d1 (f64.sub (call $load1 (call $CLIPOK)) (call $load1 (call $CUR))))
+        (local.set $d2 (f64.sub (call $load2 (call $CLIPOK)) (call $load2 (call $CUR))))
+        (if (f64.lt
+              (f64.sqrt
+                (f64.add
+                  (f64.add
+                    (f64.mul (local.get $d0) (local.get $d0))
+                    (f64.mul (local.get $d1) (local.get $d1)))
+                  (f64.mul (local.get $d2) (local.get $d2))))
+              (f64.const 0.02))
+          (then
+            (call $copy_vec (call $CLIP) (call $VEC))
+            (return)))
+        (local.set $highChroma (local.get $midChroma))
+        (br $search)))
+    (call $oklab_to_dest (call $CUR) (call $CAND)
+      (local.get $xyzToDest) (local.get $destIsD50))
+    (call $clip01 (call $CAND) (call $VEC)))
+
+  ;; ------------------------------------------------------------------
+  ;; Trigonometry for polar forms (lch, oklch). Quadrant reduction with a
+  ;; split pi/2, then odd/even Taylor polynomials on [-pi/4, pi/4].
+  ;; ------------------------------------------------------------------
+
+  (func $sin_poly (param $r f64) (result f64)
+    (local $r2 f64)
+    (local $sum f64)
+    (local.set $r2 (f64.mul (local.get $r) (local.get $r)))
+    (local.set $sum (f64.div (f64.const -1) (f64.const 1307674368000)))
+    (local.set $sum (f64.add (f64.div (f64.const 1) (f64.const 6227020800)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const -1) (f64.const 39916800)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const 1) (f64.const 362880)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const -1) (f64.const 5040)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const 1) (f64.const 120)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const -1) (f64.const 6)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.const 1) (f64.mul (local.get $sum) (local.get $r2))))
+    (f64.mul (local.get $r) (local.get $sum)))
+
+  (func $cos_poly (param $r f64) (result f64)
+    (local $r2 f64)
+    (local $sum f64)
+    (local.set $r2 (f64.mul (local.get $r) (local.get $r)))
+    (local.set $sum (f64.div (f64.const -1) (f64.const 87178291200)))
+    (local.set $sum (f64.add (f64.div (f64.const 1) (f64.const 479001600)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const -1) (f64.const 3628800)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const 1) (f64.const 40320)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const -1) (f64.const 720)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const 1) (f64.const 24)) (f64.mul (local.get $sum) (local.get $r2))))
+    (local.set $sum (f64.add (f64.div (f64.const -1) (f64.const 2)) (f64.mul (local.get $sum) (local.get $r2))))
+    (f64.add (f64.const 1) (f64.mul (local.get $sum) (local.get $r2))))
+
+  ;; sin/cos for x in [0, 2*pi). Quadrant k = floor(x / (pi/2)),
+  ;; r = x - k*pi/2 with the constant split for accuracy.
+  (func $sin (param $x f64) (result f64)
+    (local $k i32)
+    (local $r f64)
+    (local.set $k (i32.trunc_f64_s (f64.floor (f64.div (local.get $x) (f64.const 1.5707963267948966)))))
+    (local.set $r
+      (f64.sub
+        (f64.sub (local.get $x)
+          (f64.mul (f64.convert_i32_s (local.get $k)) (f64.const 1.5707963267948966)))
+        (f64.mul (f64.convert_i32_s (local.get $k)) (f64.const 6.123233995736766e-17))))
+    (local.set $k (i32.and (local.get $k) (i32.const 3)))
+    (if (result f64) (i32.eq (local.get $k) (i32.const 0))
+      (then (call $sin_poly (local.get $r)))
+      (else (if (result f64) (i32.eq (local.get $k) (i32.const 1))
+        (then (call $cos_poly (local.get $r)))
+        (else (if (result f64) (i32.eq (local.get $k) (i32.const 2))
+          (then (f64.neg (call $sin_poly (local.get $r))))
+          (else (f64.neg (call $cos_poly (local.get $r))))))))))
+
+  (func $cos (param $x f64) (result f64)
+    (call $sin (f64.add (local.get $x) (f64.const 1.5707963267948966))))
+
+  ;; ------------------------------------------------------------------
+  ;; Piecewise transfer functions for color(rec2020) and
+  ;; color(prophoto-rgb).
+  ;; ------------------------------------------------------------------
+
+  (func $rec2020_decode (export "rec2020_decode") (param $value f64) (result f64)
+    (local $sign f64)
+    (local $magnitude f64)
+    (local.set $sign (f64.copysign (f64.const 1) (local.get $value)))
+    (local.set $magnitude (f64.abs (local.get $value)))
+    (if (result f64)
+      (f64.lt (local.get $magnitude) (f64.mul (f64.const 0.018053968510807) (f64.const 4.5)))
+      (then (f64.div (local.get $value) (f64.const 4.5)))
+      (else
+        (f64.mul (local.get $sign)
+          (call $pow
+            (f64.div
+              (f64.add (local.get $magnitude) (f64.sub (f64.const 1.09929682680944) (f64.const 1)))
+              (f64.const 1.09929682680944))
+            (f64.div (f64.const 1) (f64.const 0.45)))))))
+
+  (func $rec2020_encode (export "rec2020_encode") (param $value f64) (result f64)
+    (local $sign f64)
+    (local $magnitude f64)
+    (local.set $sign (f64.copysign (f64.const 1) (local.get $value)))
+    (local.set $magnitude (f64.abs (local.get $value)))
+    (if (result f64) (f64.lt (local.get $magnitude) (f64.const 0.018053968510807))
+      (then (f64.mul (local.get $value) (f64.const 4.5)))
+      (else
+        (f64.mul (local.get $sign)
+          (f64.sub
+            (f64.mul (f64.const 1.09929682680944)
+              (call $pow (local.get $magnitude) (f64.const 0.45)))
+            (f64.sub (f64.const 1.09929682680944) (f64.const 1)))))))
+
+  (func $prophoto_decode (export "prophoto_decode") (param $value f64) (result f64)
+    (local $sign f64)
+    (local $magnitude f64)
+    (local.set $sign (f64.copysign (f64.const 1) (local.get $value)))
+    (local.set $magnitude (f64.abs (local.get $value)))
+    (if (result f64) (f64.le (local.get $magnitude) (f64.div (f64.const 16) (f64.const 512)))
+      (then (f64.div (local.get $value) (f64.const 16)))
+      (else (f64.mul (local.get $sign) (call $pow (local.get $magnitude) (f64.const 1.8))))))
+
+  (func $prophoto_encode (export "prophoto_encode") (param $value f64) (result f64)
+    (local $sign f64)
+    (local $magnitude f64)
+    (local.set $sign (f64.copysign (f64.const 1) (local.get $value)))
+    (local.set $magnitude (f64.abs (local.get $value)))
+    (if (result f64) (f64.le (local.get $magnitude) (f64.div (f64.const 1) (f64.const 512)))
+      (then (f64.mul (local.get $value) (f64.const 16)))
+      (else
+        (f64.mul (local.get $sign)
+          (call $pow (local.get $magnitude) (f64.div (f64.const 1) (f64.const 1.8)))))))
+
+  ;; ------------------------------------------------------------------
+  ;; CSS color value parser.
+  ;;
+  ;; Input: lower-case ASCII bytes at INPUT (4096). Output block:
+  ;;   2560 f64 component 0..2, 2584 f64 alpha,
+  ;;   2592 i32 missing mask, 2596 i32 alpha-is-missing,
+  ;;   2600 i32 primaries id, 2604 i32 transfer id,
+  ;;   2608 f64 gamma exponent, 2616 i32 form id.
+  ;; Primaries ids: 0 sRGB, 1 Display P3, 2 Rec.2020, 3 A98 RGB,
+  ;; 4 ProPhoto RGB, 5 XYZ D50, 6 XYZ D65. Transfer ids:
+  ;; 0 sRGB, 1 linear, 2 gamma, 3 PQ, 4 HLG, 5 Rec.2020, 6 ProPhoto RGB.
+  ;; Form ids: 1 hex, 2 rgb, 3 hsl, 4 hwb, 5 lab, 6 lch, 7 oklab,
+  ;;   8 oklch, 9 color.
+  ;; Errors: 1 unrecognized form, 2 bad number, 3 bad unit,
+  ;;   4 bad structure, 5 unknown color space, 6 trailing bytes,
+  ;;   7 bad hex.
+  ;; ------------------------------------------------------------------
+
+  (func $OUT_COMP (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2560)))
+  (func $OUT_ALPHA (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2584)))
+  (func $OUT_MISSING (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2592)))
+  (func $OUT_ALPHA_MISSING (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2596)))
+  (func $OUT_PRIMARIES (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2600)))
+  (func $OUT_TRANSFER (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2604)))
+  (func $OUT_GAMMA (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2608)))
+  (func $OUT_FORM (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 2616)))
+  (func $INPUT (result i32) (i32.add (global.get $COLOR_BASE) (i32.const 4096)))
+
+  (global $pos (mut i32) (i32.const 0))
+  (global $end (mut i32) (i32.const 0))
+  ;; Component token: 0 number, 1 percent, 2 angle in degrees, 3 none.
+  (global $tokType (mut i32) (i32.const 0))
+  (global $tokValue (mut f64) (f64.const 0))
+
+  ;; Keyword strings.
+
+  (func $peek (result i32)
+    (if (result i32) (i32.ge_u (global.get $pos) (global.get $end))
+      (then (i32.const -1))
+      (else (i32.load8_u (global.get $pos)))))
+
+  (func $advance (global.set $pos (i32.add (global.get $pos) (i32.const 1))))
+
+  (func $skip_ws
+    (local $byte i32)
+    (block $done
+      (loop $next
+        (local.set $byte (call $peek))
+        (br_if $done
+          (i32.eqz
+            (i32.or
+              (i32.or (i32.eq (local.get $byte) (i32.const 32)) (i32.eq (local.get $byte) (i32.const 9)))
+              (i32.or (i32.eq (local.get $byte) (i32.const 10)) (i32.eq (local.get $byte) (i32.const 13))))))
+        (call $advance)
+        (br $next))))
+
+  ;; Matches the keyword at $pos and advances past it, or leaves $pos.
+  (func $match_kw (param $keyword i32) (param $length i32) (result i32)
+    (local $index i32)
+    (if (i32.gt_u (i32.add (global.get $pos) (local.get $length)) (global.get $end))
+      (then (return (i32.const 0))))
+    (block $fail
+      (loop $next
+        (br_if $fail
+          (i32.ne
+            (i32.load8_u (i32.add (global.get $pos) (local.get $index)))
+            (i32.load8_u (i32.add (local.get $keyword) (local.get $index)))))
+        (local.set $index (i32.add (local.get $index) (i32.const 1)))
+        (br_if $next (i32.lt_u (local.get $index) (local.get $length))))
+      (global.set $pos (i32.add (global.get $pos) (local.get $length)))
+      (return (i32.const 1)))
+    (i32.const 0))
+
+  (func $is_ident_byte (param $byte i32) (result i32)
+    (i32.or
+      (i32.or
+        (i32.and (i32.ge_s (local.get $byte) (i32.const 97)) (i32.le_s (local.get $byte) (i32.const 122)))
+        (i32.and (i32.ge_s (local.get $byte) (i32.const 48)) (i32.le_s (local.get $byte) (i32.const 57))))
+      (i32.eq (local.get $byte) (i32.const 45))))
+
+  ;; Exact powers of ten by repeated multiplication (exact through 1e22).
+  (func $pow10 (param $exponent i32) (result f64)
+    (local $result f64)
+    (local.set $result (f64.const 1))
+    (block $done
+      (loop $next
+        (br_if $done (i32.le_s (local.get $exponent) (i32.const 0)))
+        (local.set $result (f64.mul (local.get $result) (f64.const 10)))
+        (local.set $exponent (i32.sub (local.get $exponent) (i32.const 1)))
+        (br $next)))
+    (local.get $result))
+
+  ;; Reads one number into $tokValue. Returns 0 on success, 2 on failure.
+  ;; Mantissa accumulates 15 exact digits; later digits shift the decimal
+  ;; exponent, so the result is deterministic on every host.
+  (func $read_number (result i32)
+    (local $byte i32)
+    (local $sign f64)
+    (local $mantissa i64)
+    (local $digits i32)
+    (local $decimalExponent i32)
+    (local $sawDigit i32)
+    (local $exponentSign i32)
+    (local $exponentValue i32)
+    (local $value f64)
+    (local.set $sign (f64.const 1))
+    (local.set $byte (call $peek))
+    (if (i32.eq (local.get $byte) (i32.const 43)) (then (call $advance)))
+    (if (i32.eq (local.get $byte) (i32.const 45))
+      (then (local.set $sign (f64.const -1)) (call $advance)))
+    (block $intDone
+      (loop $intNext
+        (local.set $byte (call $peek))
+        (br_if $intDone
+          (i32.or (i32.lt_s (local.get $byte) (i32.const 48)) (i32.gt_s (local.get $byte) (i32.const 57))))
+        (local.set $sawDigit (i32.const 1))
+        (if (i32.lt_s (local.get $digits) (i32.const 15))
+          (then
+            (local.set $mantissa
+              (i64.add (i64.mul (local.get $mantissa) (i64.const 10))
+                (i64.extend_i32_s (i32.sub (local.get $byte) (i32.const 48)))))
+            (local.set $digits (i32.add (local.get $digits) (i32.const 1))))
+          (else (local.set $decimalExponent (i32.add (local.get $decimalExponent) (i32.const 1)))))
+        (call $advance)
+        (br $intNext)))
+    (if (i32.eq (call $peek) (i32.const 46))
+      (then
+        (call $advance)
+        (block $fracDone
+          (loop $fracNext
+            (local.set $byte (call $peek))
+            (br_if $fracDone
+              (i32.or (i32.lt_s (local.get $byte) (i32.const 48)) (i32.gt_s (local.get $byte) (i32.const 57))))
+            (local.set $sawDigit (i32.const 1))
+            (if (i32.lt_s (local.get $digits) (i32.const 15))
+              (then
+                (local.set $mantissa
+                  (i64.add (i64.mul (local.get $mantissa) (i64.const 10))
+                    (i64.extend_i32_s (i32.sub (local.get $byte) (i32.const 48)))))
+                (local.set $digits (i32.add (local.get $digits) (i32.const 1)))
+                (local.set $decimalExponent (i32.sub (local.get $decimalExponent) (i32.const 1)))))
+            (call $advance)
+            (br $fracNext)))))
+    (if (i32.eqz (local.get $sawDigit)) (then (return (i32.const 2))))
+    (if (i32.eq (call $peek) (i32.const 101))
+      (then
+        (call $advance)
+        (local.set $exponentSign (i32.const 1))
+        (local.set $byte (call $peek))
+        (if (i32.eq (local.get $byte) (i32.const 43)) (then (call $advance)))
+        (if (i32.eq (local.get $byte) (i32.const 45))
+          (then (local.set $exponentSign (i32.const -1)) (call $advance)))
+        (local.set $byte (call $peek))
+        (if (i32.or (i32.lt_s (local.get $byte) (i32.const 48)) (i32.gt_s (local.get $byte) (i32.const 57)))
+          (then (return (i32.const 2))))
+        (block $expDone
+          (loop $expNext
+            (local.set $byte (call $peek))
+            (br_if $expDone
+              (i32.or (i32.lt_s (local.get $byte) (i32.const 48)) (i32.gt_s (local.get $byte) (i32.const 57))))
+            (if (i32.lt_s (local.get $exponentValue) (i32.const 400))
+              (then
+                (local.set $exponentValue
+                  (i32.add (i32.mul (local.get $exponentValue) (i32.const 10))
+                    (i32.sub (local.get $byte) (i32.const 48))))))
+            (call $advance)
+            (br $expNext)))
+        (local.set $decimalExponent
+          (i32.add (local.get $decimalExponent)
+            (i32.mul (local.get $exponentSign) (local.get $exponentValue))))))
+    (local.set $value (f64.convert_i64_s (local.get $mantissa)))
+    (if (i32.gt_s (local.get $decimalExponent) (i32.const 0))
+      (then
+        (local.set $value (f64.mul (local.get $value) (call $pow10 (local.get $decimalExponent)))))
+      (else
+        (if (i32.lt_s (local.get $decimalExponent) (i32.const 0))
+          (then
+            (local.set $value
+              (f64.div (local.get $value)
+                (call $pow10 (i32.sub (i32.const 0) (local.get $decimalExponent)))))))))
+    (global.set $tokValue (f64.mul (local.get $sign) (local.get $value)))
+    (i32.const 0))
+
+  ;; Reads one component token: none | number [% | angle unit].
+  ;; Returns 0 on success or an error code.
+  (func $read_component (result i32)
+    (local $status i32)
+    (call $skip_ws)
+    (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3080)) (i32.const 4))
+      (then
+        (global.set $tokType (i32.const 3))
+        (global.set $tokValue (f64.const 0))
+        (return (i32.const 0))))
+    (local.set $status (call $read_number))
+    (if (local.get $status) (then (return (local.get $status))))
+    (if (i32.eq (call $peek) (i32.const 37))
+      (then
+        (call $advance)
+        (global.set $tokType (i32.const 1))
+        (return (i32.const 0))))
+    (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3088)) (i32.const 3))
+      (then (global.set $tokType (i32.const 2)) (return (i32.const 0))))
+    (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3096)) (i32.const 4))
+      (then
+        (global.set $tokValue (f64.mul (global.get $tokValue) (f64.const 0.9)))
+        (global.set $tokType (i32.const 2))
+        (return (i32.const 0))))
+    (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3104)) (i32.const 3))
+      (then
+        (global.set $tokValue
+          (f64.mul (global.get $tokValue) (f64.div (f64.const 180) (f64.const 3.141592653589793))))
+        (global.set $tokType (i32.const 2))
+        (return (i32.const 0))))
+    (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3112)) (i32.const 4))
+      (then
+        (global.set $tokValue (f64.mul (global.get $tokValue) (f64.const 360)))
+        (global.set $tokType (i32.const 2))
+        (return (i32.const 0))))
+    (if (call $is_ident_byte (call $peek)) (then (return (i32.const 3))))
+    (global.set $tokType (i32.const 0))
+    (i32.const 0))
+
+  ;; Alpha suffix: [legacy ',' | '/'] component, then ')'. Writes alpha
+  ;; outputs. Returns 0 or an error code.
+  (func $read_alpha_and_close (param $legacy i32) (result i32)
+    (local $status i32)
+    (f64.store (call $OUT_ALPHA) (f64.const 1))
+    (i32.store (call $OUT_ALPHA_MISSING) (i32.const 0))
+    (call $skip_ws)
+    (if (i32.eq (call $peek) (i32.const 41))
+      (then (call $advance) (return (i32.const 0))))
+    (if (local.get $legacy)
+      (then
+        (if (i32.ne (call $peek) (i32.const 44)) (then (return (i32.const 4))))
+        (call $advance))
+      (else
+        (if (i32.ne (call $peek) (i32.const 47)) (then (return (i32.const 4))))
+        (call $advance)))
+    (local.set $status (call $read_component))
+    (if (local.get $status) (then (return (local.get $status))))
+    (if (i32.eq (global.get $tokType) (i32.const 2)) (then (return (i32.const 3))))
+    (if (i32.eq (global.get $tokType) (i32.const 3))
+      (then (i32.store (call $OUT_ALPHA_MISSING) (i32.const 1)))
+      (else
+        (f64.store (call $OUT_ALPHA)
+          (if (result f64) (i32.eq (global.get $tokType) (i32.const 1))
+            (then (f64.div (global.get $tokValue) (f64.const 100)))
+            (else (global.get $tokValue))))))
+    (call $skip_ws)
+    (if (i32.ne (call $peek) (i32.const 41)) (then (return (i32.const 4))))
+    (call $advance)
+    (i32.const 0))
+
+  ;; Reads three components with one separator style. $legacy is detected
+  ;; from the byte after the first component. Components land in OUT_COMP
+  ;; raw with their token types in $type0..2 packed into the return via
+  ;; globals below.
+  (global $type0 (mut i32) (i32.const 0))
+  (global $type1 (mut i32) (i32.const 0))
+  (global $type2 (mut i32) (i32.const 0))
+  (global $legacyForm (mut i32) (i32.const 0))
+
+  (func $read_three_components (result i32)
+    (local $status i32)
+    (local.set $status (call $read_component))
+    (if (local.get $status) (then (return (local.get $status))))
+    (global.set $type0 (global.get $tokType))
+    (f64.store (call $OUT_COMP) (global.get $tokValue))
+    (call $skip_ws)
+    (global.set $legacyForm (i32.eq (call $peek) (i32.const 44)))
+    (if (global.get $legacyForm)
+      (then
+        (if (i32.eq (global.get $type0) (i32.const 3)) (then (return (i32.const 4))))
+        (call $advance)))
+    (local.set $status (call $read_component))
+    (if (local.get $status) (then (return (local.get $status))))
+    (global.set $type1 (global.get $tokType))
+    (f64.store (i32.add (call $OUT_COMP) (i32.const 8)) (global.get $tokValue))
+    (call $skip_ws)
+    (if (global.get $legacyForm)
+      (then
+        (if (i32.or
+              (i32.ne (call $peek) (i32.const 44))
+              (i32.eq (global.get $type1) (i32.const 3)))
+          (then (return (i32.const 4))))
+        (call $advance)))
+    (local.set $status (call $read_component))
+    (if (local.get $status) (then (return (local.get $status))))
+    (global.set $type2 (global.get $tokType))
+    (if (i32.and (global.get $legacyForm) (i32.eq (global.get $tokType) (i32.const 3)))
+      (then (return (i32.const 4))))
+    (f64.store (i32.add (call $OUT_COMP) (i32.const 16)) (global.get $tokValue))
+    (i32.const 0))
+
+  (func $set_missing_mask
+    (i32.store (call $OUT_MISSING)
+      (i32.or
+        (i32.or
+          (i32.eq (global.get $type0) (i32.const 3))
+          (i32.shl (i32.eq (global.get $type1) (i32.const 3)) (i32.const 1)))
+        (i32.shl (i32.eq (global.get $type2) (i32.const 3)) (i32.const 2)))))
+
+  (func $set_encoding (param $primaries i32) (param $transfer i32) (param $gamma f64) (param $form i32)
+    (i32.store (call $OUT_PRIMARIES) (local.get $primaries))
+    (i32.store (call $OUT_TRANSFER) (local.get $transfer))
+    (f64.store (call $OUT_GAMMA) (local.get $gamma))
+    (i32.store (call $OUT_FORM) (local.get $form)))
+
+  (func $store_comp (param $index i32) (param $value f64)
+    (f64.store (i32.add (call $OUT_COMP) (i32.mul (local.get $index) (i32.const 8)))
+      (local.get $value)))
+
+  (func $load_comp (param $index i32) (result f64)
+    (f64.load (i32.add (call $OUT_COMP) (i32.mul (local.get $index) (i32.const 8)))))
+
+  ;; Scales one stored component: percent value maps [0,100%] onto
+  ;; [0, percentScale]; a plain number multiplies numberScale.
+  (func $scale_comp (param $index i32) (param $type i32) (param $numberScale f64) (param $percentScale f64)
+    (if (i32.eq (local.get $type) (i32.const 1))
+      (then
+        (call $store_comp (local.get $index)
+          (f64.mul (f64.div (call $load_comp (local.get $index)) (f64.const 100)) (local.get $percentScale))))
+      (else
+        (call $store_comp (local.get $index)
+          (f64.mul (call $load_comp (local.get $index)) (local.get $numberScale))))))
+
+  ;; Hue helper for hsl/hwb: f(n) per CSS Color 4, h in degrees.
+  (func $hsl_f (param $n f64) (param $h f64) (param $s f64) (param $l f64) (result f64)
+    (local $k f64)
+    (local $a f64)
+    (local.set $k (f64.add (local.get $n) (f64.div (local.get $h) (f64.const 30))))
+    (local.set $k (f64.sub (local.get $k) (f64.mul (f64.const 12) (f64.floor (f64.div (local.get $k) (f64.const 12))))))
+    (local.set $a (f64.mul (local.get $s) (f64.min (local.get $l) (f64.sub (f64.const 1) (local.get $l)))))
+    (f64.sub (local.get $l)
+      (f64.mul (local.get $a)
+        (f64.max (f64.const -1)
+          (f64.min
+            (f64.min (f64.sub (local.get $k) (f64.const 3)) (f64.sub (f64.const 9) (local.get $k)))
+            (f64.const 1))))))
+
+  (func $normalize_hue (param $h f64) (result f64)
+    (f64.sub (local.get $h) (f64.mul (f64.const 360) (f64.floor (f64.div (local.get $h) (f64.const 360))))))
+
+  ;; Converts stored lab components through the shared VEC pipeline into
+  ;; XYZ D65 and stores them back.
+  (func $lab_comps_to_xyz_d65
+    (call $store_vec (call $VEC)
+      (call $load_comp (i32.const 0)) (call $load_comp (i32.const 1)) (call $load_comp (i32.const 2)))
+    (call $lab_to_xyz_d50)
+    (call $apply_matrix (i32.const 10))
+    (call $store_comp (i32.const 0) (call $load0 (call $VEC)))
+    (call $store_comp (i32.const 1) (call $load1 (call $VEC)))
+    (call $store_comp (i32.const 2) (call $load2 (call $VEC))))
+
+  (func $oklab_comps_to_xyz_d65
+    (call $store_vec (call $VEC)
+      (call $load_comp (i32.const 0)) (call $load_comp (i32.const 1)) (call $load_comp (i32.const 2)))
+    (call $oklab_to_xyz_d65)
+    (call $store_comp (i32.const 0) (call $load0 (call $VEC)))
+    (call $store_comp (i32.const 1) (call $load1 (call $VEC)))
+    (call $store_comp (i32.const 2) (call $load2 (call $VEC))))
+
+  ;; Polar to rectangular for lch/oklch: component1 = chroma,
+  ;; component2 = hue degrees.
+  (func $polar_to_rectangular
+    (local $chroma f64)
+    (local $hueRadians f64)
+    (local.set $chroma (call $load_comp (i32.const 1)))
+    (local.set $hueRadians
+      (f64.mul (call $normalize_hue (call $load_comp (i32.const 2)))
+        (f64.div (f64.const 3.141592653589793) (f64.const 180))))
+    (call $store_comp (i32.const 1) (f64.mul (local.get $chroma) (call $cos (local.get $hueRadians))))
+    (call $store_comp (i32.const 2) (f64.mul (local.get $chroma) (call $sin (local.get $hueRadians)))))
+
+  ;; Hex digits: returns 0-15 or -1.
+  (func $hex_digit (param $byte i32) (result i32)
+    (if (i32.and (i32.ge_s (local.get $byte) (i32.const 48)) (i32.le_s (local.get $byte) (i32.const 57)))
+      (then (return (i32.sub (local.get $byte) (i32.const 48)))))
+    (if (i32.and (i32.ge_s (local.get $byte) (i32.const 97)) (i32.le_s (local.get $byte) (i32.const 102)))
+      (then (return (i32.sub (local.get $byte) (i32.const 87)))))
+    (i32.const -1))
+
+  (func $parse_hex (result i32)
+    (local $length i32)
+    (local $index i32)
+    (local $digit i32)
+    (local $high i32)
+    (local $low i32)
+    (call $advance)
+    (local.set $length (i32.sub (global.get $end) (global.get $pos)))
+    ;; Validate every digit first.
+    (block $checked
+      (loop $check
+        (br_if $checked (i32.ge_s (local.get $index) (local.get $length)))
+        (if (i32.lt_s (call $hex_digit (i32.load8_u (i32.add (global.get $pos) (local.get $index)))) (i32.const 0))
+          (then (return (i32.const 7))))
+        (local.set $index (i32.add (local.get $index) (i32.const 1)))
+        (br $check)))
+    (f64.store (call $OUT_ALPHA) (f64.const 1))
+    (i32.store (call $OUT_ALPHA_MISSING) (i32.const 0))
+    (i32.store (call $OUT_MISSING) (i32.const 0))
+    (call $set_encoding (i32.const 0) (i32.const 0) (f64.const 0) (i32.const 1))
+    (if (i32.or (i32.eq (local.get $length) (i32.const 3)) (i32.eq (local.get $length) (i32.const 4)))
+      (then
+        (local.set $index (i32.const 0))
+        (block $shortDone
+          (loop $shortNext
+            (br_if $shortDone (i32.ge_s (local.get $index) (local.get $length)))
+            (local.set $digit (call $hex_digit (i32.load8_u (i32.add (global.get $pos) (local.get $index)))))
+            (local.set $digit (i32.add (i32.mul (local.get $digit) (i32.const 16)) (local.get $digit)))
+            (if (i32.lt_s (local.get $index) (i32.const 3))
+              (then
+                (call $store_comp (local.get $index)
+                  (f64.div (f64.convert_i32_s (local.get $digit)) (f64.const 255))))
+              (else
+                (f64.store (call $OUT_ALPHA)
+                  (f64.div (f64.convert_i32_s (local.get $digit)) (f64.const 255)))))
+            (local.set $index (i32.add (local.get $index) (i32.const 1)))
+            (br $shortNext)))
+        (global.set $pos (global.get $end))
+        (return (i32.const 0))))
+    (if (i32.or (i32.eq (local.get $length) (i32.const 6)) (i32.eq (local.get $length) (i32.const 8)))
+      (then
+        (local.set $index (i32.const 0))
+        (block $longDone
+          (loop $longNext
+            (br_if $longDone (i32.ge_s (i32.mul (local.get $index) (i32.const 2)) (local.get $length)))
+            (local.set $high (call $hex_digit (i32.load8_u (i32.add (global.get $pos) (i32.mul (local.get $index) (i32.const 2))))))
+            (local.set $low (call $hex_digit (i32.load8_u (i32.add (i32.add (global.get $pos) (i32.mul (local.get $index) (i32.const 2))) (i32.const 1)))))
+            (local.set $digit (i32.add (i32.mul (local.get $high) (i32.const 16)) (local.get $low)))
+            (if (i32.lt_s (local.get $index) (i32.const 3))
+              (then
+                (call $store_comp (local.get $index)
+                  (f64.div (f64.convert_i32_s (local.get $digit)) (f64.const 255))))
+              (else
+                (f64.store (call $OUT_ALPHA)
+                  (f64.div (f64.convert_i32_s (local.get $digit)) (f64.const 255)))))
+            (local.set $index (i32.add (local.get $index) (i32.const 1)))
+            (br $longNext)))
+        (global.set $pos (global.get $end))
+        (return (i32.const 0))))
+    (i32.const 7))
+
+  ;; The main entry point. Input bytes are lower-case ASCII at INPUT.
+  (func $parse_css_color (param $length i32) (result i32)
+    (local $status i32)
+    (local $form i32)
+    (local $hue f64)
+    (local $saturation f64)
+    (local $lightnessOrWhite f64)
+    (local $blackness f64)
+    (local $gray f64)
+    (local $index i32)
+    (local $primaries i32)
+    (local $transfer i32)
+    (local $gamma f64)
+    (global.set $pos (call $INPUT))
+    (global.set $end (i32.add (call $INPUT) (local.get $length)))
+    (i32.store (call $OUT_MISSING) (i32.const 0))
+    (call $skip_ws)
+    (if (i32.eq (call $peek) (i32.const 35))
+      (then
+        (local.set $status (call $parse_hex))
+        (if (local.get $status) (then (return (local.get $status))))
+        (return (i32.const 0))))
+    ;; Dispatch on the function keyword. Longer spellings first.
+    (local.set $form (i32.const 0))
+    (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3000)) (i32.const 5)) (then (local.set $form (i32.const 2))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3008)) (i32.const 4)) (then (local.set $form (i32.const 2))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3016)) (i32.const 5)) (then (local.set $form (i32.const 3))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3024)) (i32.const 4)) (then (local.set $form (i32.const 3))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3032)) (i32.const 4)) (then (local.set $form (i32.const 4))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3040)) (i32.const 4)) (then (local.set $form (i32.const 5))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3048)) (i32.const 4)) (then (local.set $form (i32.const 6))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3056)) (i32.const 6)) (then (local.set $form (i32.const 7))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3064)) (i32.const 6)) (then (local.set $form (i32.const 8))))))
+    (if (i32.eqz (local.get $form))
+      (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3072)) (i32.const 6)) (then (local.set $form (i32.const 9))))))
+    (if (i32.eqz (local.get $form)) (then (return (i32.const 1))))
+    ;; color(): resolve the space identifier first.
+    (local.set $primaries (i32.const 0))
+    (local.set $transfer (i32.const 0))
+    (local.set $gamma (f64.const 0))
+    (if (i32.eq (local.get $form) (i32.const 9))
+      (then
+        (call $skip_ws)
+        (local.set $primaries (i32.const -1))
+        (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3120)) (i32.const 11))
+          (then (local.set $primaries (i32.const 0)) (local.set $transfer (i32.const 1))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3136)) (i32.const 4))
+            (then (local.set $primaries (i32.const 0)) (local.set $transfer (i32.const 0))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3144)) (i32.const 10))
+            (then (local.set $primaries (i32.const 1)) (local.set $transfer (i32.const 0))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3160)) (i32.const 7))
+            (then
+              (local.set $primaries (i32.const 3))
+              (local.set $transfer (i32.const 2))
+              (local.set $gamma (f64.div (f64.const 563) (f64.const 256)))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3168)) (i32.const 12))
+            (then (local.set $primaries (i32.const 4)) (local.set $transfer (i32.const 6))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3192)) (i32.const 10))
+            (then (local.set $primaries (i32.const 2)) (local.set $transfer (i32.const 3))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3208)) (i32.const 11))
+            (then (local.set $primaries (i32.const 2)) (local.set $transfer (i32.const 4))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3224)) (i32.const 14))
+            (then (local.set $primaries (i32.const 2)) (local.set $transfer (i32.const 1))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3184)) (i32.const 7))
+            (then (local.set $primaries (i32.const 2)) (local.set $transfer (i32.const 5))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3240)) (i32.const 7))
+            (then (local.set $primaries (i32.const 5)) (local.set $transfer (i32.const 1))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3248)) (i32.const 7))
+            (then (local.set $primaries (i32.const 6)) (local.set $transfer (i32.const 1))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3256)) (i32.const 3))
+            (then (local.set $primaries (i32.const 6)) (local.set $transfer (i32.const 1))))))
+        (if (i32.eq (local.get $primaries) (i32.const -1)) (then (return (i32.const 5))))
+        (if (call $is_ident_byte (call $peek)) (then (return (i32.const 5))))))
+    ;; Three components.
+    (local.set $status (call $read_three_components))
+    (if (local.get $status) (then (return (local.get $status))))
+    ;; Alpha and the closing parenthesis.
+    (local.set $status (call $read_alpha_and_close (global.get $legacyForm)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (call $skip_ws)
+    (if (i32.ne (call $peek) (i32.const -1)) (then (return (i32.const 6))))
+    ;; Form-specific scaling and conversion.
+    (call $set_missing_mask)
+    (if (i32.eq (local.get $form) (i32.const 2))
+      (then ;; rgb: number /255, percent -> 0..1. Angles are invalid.
+        (if (i32.or (i32.eq (global.get $type0) (i32.const 2))
+              (i32.or (i32.eq (global.get $type1) (i32.const 2)) (i32.eq (global.get $type2) (i32.const 2))))
+          (then (return (i32.const 3))))
+        (call $scale_comp (i32.const 0) (global.get $type0) (f64.div (f64.const 1) (f64.const 255)) (f64.const 1))
+        (call $scale_comp (i32.const 1) (global.get $type1) (f64.div (f64.const 1) (f64.const 255)) (f64.const 1))
+        (call $scale_comp (i32.const 2) (global.get $type2) (f64.div (f64.const 1) (f64.const 255)) (f64.const 1))
+        (call $set_encoding (i32.const 0) (i32.const 0) (f64.const 0) (i32.const 2))
+        (return (i32.const 0))))
+    (if (i32.or (i32.eq (local.get $form) (i32.const 3)) (i32.eq (local.get $form) (i32.const 4)))
+      (then ;; hsl / hwb: none converts as zero, mask stays clear.
+        (i32.store (call $OUT_MISSING) (i32.const 0))
+        (if (i32.eq (global.get $type1) (i32.const 2)) (then (return (i32.const 3))))
+        (if (i32.eq (global.get $type2) (i32.const 2)) (then (return (i32.const 3))))
+        (local.set $hue (call $normalize_hue (call $load_comp (i32.const 0))))
+        (call $scale_comp (i32.const 1) (global.get $type1) (f64.div (f64.const 1) (f64.const 100)) (f64.const 1))
+        (call $scale_comp (i32.const 2) (global.get $type2) (f64.div (f64.const 1) (f64.const 100)) (f64.const 1))
+        (if (i32.eq (local.get $form) (i32.const 3))
+          (then
+            (local.set $saturation (call $load_comp (i32.const 1)))
+            (local.set $lightnessOrWhite (call $load_comp (i32.const 2)))
+            (call $store_comp (i32.const 0)
+              (call $hsl_f (f64.const 0) (local.get $hue) (local.get $saturation) (local.get $lightnessOrWhite)))
+            (call $store_comp (i32.const 1)
+              (call $hsl_f (f64.const 8) (local.get $hue) (local.get $saturation) (local.get $lightnessOrWhite)))
+            (call $store_comp (i32.const 2)
+              (call $hsl_f (f64.const 4) (local.get $hue) (local.get $saturation) (local.get $lightnessOrWhite))))
+          (else
+            (local.set $lightnessOrWhite (call $load_comp (i32.const 1)))
+            (local.set $blackness (call $load_comp (i32.const 2)))
+            (if (f64.ge (f64.add (local.get $lightnessOrWhite) (local.get $blackness)) (f64.const 1))
+              (then
+                (local.set $gray
+                  (f64.div (local.get $lightnessOrWhite)
+                    (f64.add (local.get $lightnessOrWhite) (local.get $blackness))))
+                (call $store_comp (i32.const 0) (local.get $gray))
+                (call $store_comp (i32.const 1) (local.get $gray))
+                (call $store_comp (i32.const 2) (local.get $gray)))
+              (else
+                (block $hwbDone
+                  (local.set $index (i32.const 0))
+                  (loop $hwbNext
+                    (br_if $hwbDone (i32.ge_s (local.get $index) (i32.const 3)))
+                    (call $store_comp (local.get $index)
+                      (f64.add
+                        (f64.mul
+                          (call $hsl_f
+                            (select (f64.const 0) (select (f64.const 8) (f64.const 4) (i32.eq (local.get $index) (i32.const 1))) (i32.eqz (local.get $index)))
+                            (local.get $hue) (f64.const 1) (f64.const 0.5))
+                          (f64.sub (f64.sub (f64.const 1) (local.get $lightnessOrWhite)) (local.get $blackness)))
+                        (local.get $lightnessOrWhite)))
+                    (local.set $index (i32.add (local.get $index) (i32.const 1)))
+                    (br $hwbNext)))))))
+        (call $set_encoding (i32.const 0) (i32.const 0) (f64.const 0) (local.get $form))
+        (return (i32.const 0))))
+    (if (i32.or (i32.eq (local.get $form) (i32.const 5)) (i32.eq (local.get $form) (i32.const 6)))
+      (then ;; lab / lch: L percent -> 0..100; a,b percent -> +-125; chroma percent -> +-150.
+        (call $scale_comp (i32.const 0) (global.get $type0) (f64.const 1) (f64.const 100))
+        (if (i32.eq (local.get $form) (i32.const 5))
+          (then
+            (call $scale_comp (i32.const 1) (global.get $type1) (f64.const 1) (f64.const 125))
+            (call $scale_comp (i32.const 2) (global.get $type2) (f64.const 1) (f64.const 125)))
+          (else
+            (call $scale_comp (i32.const 1) (global.get $type1) (f64.const 1) (f64.const 150))
+            (call $polar_to_rectangular)))
+        (call $lab_comps_to_xyz_d65)
+        (call $set_encoding (i32.const 6) (i32.const 1) (f64.const 0) (local.get $form))
+        (return (i32.const 0))))
+    (if (i32.or (i32.eq (local.get $form) (i32.const 7)) (i32.eq (local.get $form) (i32.const 8)))
+      (then ;; oklab / oklch: L percent -> 0..1; a,b percent -> +-0.4.
+        (call $scale_comp (i32.const 0) (global.get $type0) (f64.const 1) (f64.const 1))
+        (if (i32.eq (local.get $form) (i32.const 7))
+          (then
+            (call $scale_comp (i32.const 1) (global.get $type1) (f64.const 1) (f64.const 0.4))
+            (call $scale_comp (i32.const 2) (global.get $type2) (f64.const 1) (f64.const 0.4)))
+          (else
+            (call $scale_comp (i32.const 1) (global.get $type1) (f64.const 1) (f64.const 0.4))
+            (call $polar_to_rectangular)))
+        (call $oklab_comps_to_xyz_d65)
+        (call $set_encoding (i32.const 6) (i32.const 1) (f64.const 0) (local.get $form))
+        (return (i32.const 0))))
+    ;; color(): components are numbers or percents on the 0..1 scale.
+    (if (i32.or (i32.eq (global.get $type0) (i32.const 2))
+          (i32.or (i32.eq (global.get $type1) (i32.const 2)) (i32.eq (global.get $type2) (i32.const 2))))
+      (then (return (i32.const 3))))
+    (call $scale_comp (i32.const 0) (global.get $type0) (f64.const 1) (f64.const 1))
+    (call $scale_comp (i32.const 1) (global.get $type1) (f64.const 1) (f64.const 1))
+    (call $scale_comp (i32.const 2) (global.get $type2) (f64.const 1) (f64.const 1))
+    (call $set_encoding (local.get $primaries) (local.get $transfer) (local.get $gamma) (i32.const 9))
+    (i32.const 0))
+
+  ;; Complete the parser record in place. The raw parser retains authored
+  ;; missing components for source-form inspection; converted Lab families
+  ;; publish numeric components and therefore clear the consumer mask.
+  (func $color_complete_css_result
+    (local $form i32)
+    (local $primaries i32)
+    (local.set $form (i32.load (call $OUT_FORM)))
+    (local.set $primaries (i32.load (call $OUT_PRIMARIES)))
+    (i32.store offset=60 (call $OUT_COMP) (i32.load (call $OUT_MISSING)))
+    (if (i32.and (i32.ge_u (local.get $form) (i32.const 5))
+      (i32.le_u (local.get $form) (i32.const 8)))
+      (then (i32.store (call $OUT_MISSING) (i32.const 0))))
+    (i32.store offset=64 (call $OUT_COMP)
+      (select (i32.const 0) (i32.const 1)
+        (i32.or (i32.eq (local.get $primaries) (i32.const 4))
+          (i32.eq (local.get $primaries) (i32.const 5)))))
+    (i32.store offset=68 (call $OUT_COMP) (i32.const 1))
+    (f64.store offset=72 (call $OUT_COMP) (f64.const 203)))
+
+  ;; Normalize ASCII case in the documented parser buffer. On success the
+  ;; complete 80-byte tagged-color record begins at the documented result
+  ;; offset; no host inference or preprocessing is needed.
+  (func (export "color_parse_css") (param $length i32) (result i32)
+    (local $status i32) (local $index i32) (local $byte i32)
+    (if (i32.gt_u (local.get $length) (i32.const 2048))
+      (then (return (i32.const 4))))
+    (block $normalized
+      (loop $normalize
+        (br_if $normalized (i32.eq (local.get $index) (local.get $length)))
+        (local.set $byte (i32.load8_u (i32.add (call $INPUT) (local.get $index))))
+        (if (i32.and (i32.ge_u (local.get $byte) (i32.const 65))
+          (i32.le_u (local.get $byte) (i32.const 90)))
+          (then
+            (i32.store8 (i32.add (call $INPUT) (local.get $index))
+              (i32.add (local.get $byte) (i32.const 32)))))
+        (local.set $index (i32.add (local.get $index) (i32.const 1)))
+        (br $normalize)))
+    (local.set $status (call $parse_css_color (local.get $length)))
+    (if (i32.eqz (local.get $status)) (then (call $color_complete_css_result)))
+    (local.get $status))
+
+  ;; ------------------------------------------------------------------
+  ;; ICC profile lookup-table pipeline (src/color-profile.js).
+  ;;
+  ;; Applies one parsed A2B transform to a batch of device pixels IN
+  ;; PLACE: per-channel curve stages (sampled tables, linear
+  ;; interpolation), a trilinear 3-channel color lookup table, an
+  ;; optional 3x3 matrix with offsets, the profile connection space
+  ;; decode (XYZ u1.15 or Lab), and Bradford D50 -> D65 adaptation.
+  ;; Output is linear XYZ at D65.
+  ;;
+  ;; The caller lays every table out in kernel memory above the fixed
+  ;; scratch region and passes explicit pointers; a stage with entries
+  ;; 0 / grid 0 / pointer 0 is skipped.
+  ;; pcsMode: 0 = XYZ (u1.15 scale), 1 = Lab in the legacy 16-bit
+  ;; encoding (mft2), 2 = Lab in the 8-bit / version 4 encoding
+  ;; (mft1, mAB).
+  ;; ------------------------------------------------------------------
+
+  ;; Sample one curve table (entries f64 values over [0,1]) at x.
+  (func $profile_curve (param $ptr i32) (param $entries i32) (param $x f64) (result f64)
+    (local $t f64)
+    (local $index i32)
+    (local $start f64)
+    (local.set $x (f64.min (f64.max (local.get $x) (f64.const 0)) (f64.const 1)))
+    (local.set $t
+      (f64.mul (local.get $x)
+        (f64.convert_i32_s (i32.sub (local.get $entries) (i32.const 1)))))
+    (local.set $index (i32.trunc_f64_s (f64.floor (local.get $t))))
+    (if (i32.ge_s (local.get $index) (i32.sub (local.get $entries) (i32.const 1)))
+      (then
+        (return
+          (f64.load
+            (i32.add (local.get $ptr)
+              (i32.mul (i32.sub (local.get $entries) (i32.const 1)) (i32.const 8)))))))
+    (local.set $start
+      (f64.load (i32.add (local.get $ptr) (i32.mul (local.get $index) (i32.const 8)))))
+    (f64.add (local.get $start)
+      (f64.mul
+        (f64.sub
+          (f64.load
+            (i32.add (local.get $ptr)
+              (i32.mul (i32.add (local.get $index) (i32.const 1)) (i32.const 8))))
+          (local.get $start))
+        (f64.sub (local.get $t) (f64.convert_i32_s (local.get $index))))))
+
+  ;; One color-lookup-table entry: grid-cell (r,g,b), output channel ch.
+  (func $clut_fetch (param $clutPtr i32) (param $grid i32)
+    (param $r i32) (param $g i32) (param $b i32) (param $ch i32) (result f64)
+    (f64.load
+      (i32.add (local.get $clutPtr)
+        (i32.add
+          (i32.mul
+            (i32.add
+              (i32.mul
+                (i32.add (i32.mul (local.get $r) (local.get $grid)) (local.get $g))
+                (local.get $grid))
+              (local.get $b))
+            (i32.const 24))
+          (i32.mul (local.get $ch) (i32.const 8))))))
+
+  ;; Trilinear interpolation for one output channel.
+  (func $clut_trilinear (param $clutPtr i32) (param $grid i32)
+    (param $r0 i32) (param $g0 i32) (param $b0 i32)
+    (param $fr f64) (param $fg f64) (param $fb f64) (param $ch i32) (result f64)
+    (local $r1 i32)
+    (local $g1 i32)
+    (local $b1 i32)
+    (local $v0 f64)
+    (local $v1 f64)
+    (local $lo f64)
+    (local $hi f64)
+    (local.set $r1 (i32.add (local.get $r0) (i32.const 1)))
+    (local.set $g1 (i32.add (local.get $g0) (i32.const 1)))
+    (local.set $b1 (i32.add (local.get $b0) (i32.const 1)))
+    ;; b axis, then g axis, at r0.
+    (local.set $lo
+      (call $lerp
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r0) (local.get $g0) (local.get $b0) (local.get $ch))
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r0) (local.get $g0) (local.get $b1) (local.get $ch))
+        (local.get $fb)))
+    (local.set $hi
+      (call $lerp
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r0) (local.get $g1) (local.get $b0) (local.get $ch))
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r0) (local.get $g1) (local.get $b1) (local.get $ch))
+        (local.get $fb)))
+    (local.set $v0 (call $lerp (local.get $lo) (local.get $hi) (local.get $fg)))
+    ;; b axis, then g axis, at r1.
+    (local.set $lo
+      (call $lerp
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r1) (local.get $g0) (local.get $b0) (local.get $ch))
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r1) (local.get $g0) (local.get $b1) (local.get $ch))
+        (local.get $fb)))
+    (local.set $hi
+      (call $lerp
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r1) (local.get $g1) (local.get $b0) (local.get $ch))
+        (call $clut_fetch (local.get $clutPtr) (local.get $grid) (local.get $r1) (local.get $g1) (local.get $b1) (local.get $ch))
+        (local.get $fb)))
+    (local.set $v1 (call $lerp (local.get $lo) (local.get $hi) (local.get $fg)))
+    (call $lerp (local.get $v0) (local.get $v1) (local.get $fr)))
+
+  (func $lerp (param $a f64) (param $b f64) (param $t f64) (result f64)
+    (f64.add (local.get $a) (f64.mul (f64.sub (local.get $b) (local.get $a)) (local.get $t))))
+
+  ;; Grid coordinate split: index (clamped to grid-2) and fraction.
+  ;; Returns the index; writes the fraction to $TMP + slot*8.
+  (func $clut_coord (param $x f64) (param $grid i32) (param $slot i32) (result i32)
+    (local $t f64)
+    (local $index i32)
+    (local.set $t
+      (f64.mul
+        (f64.min (f64.max (local.get $x) (f64.const 0)) (f64.const 1))
+        (f64.convert_i32_s (i32.sub (local.get $grid) (i32.const 1)))))
+    (local.set $index (i32.trunc_f64_s (f64.floor (local.get $t))))
+    (if (i32.gt_s (local.get $index) (i32.sub (local.get $grid) (i32.const 2)))
+      (then (local.set $index (i32.sub (local.get $grid) (i32.const 2)))))
+    (f64.store
+      (i32.add (call $TMP) (i32.mul (local.get $slot) (i32.const 8)))
+      (f64.sub (local.get $t) (f64.convert_i32_s (local.get $index))))
+    (local.get $index))
+
+
+  ;; Store the XYZ vector represented by an xy chromaticity.
+  (func $colorStoreXyXyz (param $pointer i32) (param $x f64) (param $y f64)
+    (f64.store (local.get $pointer) (f64.div (local.get $x) (local.get $y)))
+    (f64.store offset=8 (local.get $pointer) (f64.const 1))
+    (f64.store offset=16 (local.get $pointer)
+      (f64.div
+        (f64.sub (f64.sub (f64.const 1) (local.get $x)) (local.get $y))
+        (local.get $y))))
+
+  ;; Invert one row-major 3 by 3 matrix. Source and destination must differ.
+  (func $colorMatrixInvert (param $source i32) (param $destination i32)
+    (local $a f64) (local $b f64) (local $c f64)
+    (local $d f64) (local $e f64) (local $f f64)
+    (local $g f64) (local $h f64) (local $i f64)
+    (local $ca f64) (local $cb f64) (local $cc f64) (local $scale f64)
+    (local.set $a (f64.load (local.get $source)))
+    (local.set $b (f64.load offset=8 (local.get $source)))
+    (local.set $c (f64.load offset=16 (local.get $source)))
+    (local.set $d (f64.load offset=24 (local.get $source)))
+    (local.set $e (f64.load offset=32 (local.get $source)))
+    (local.set $f (f64.load offset=40 (local.get $source)))
+    (local.set $g (f64.load offset=48 (local.get $source)))
+    (local.set $h (f64.load offset=56 (local.get $source)))
+    (local.set $i (f64.load offset=64 (local.get $source)))
+    (local.set $ca (f64.sub (f64.mul (local.get $e) (local.get $i)) (f64.mul (local.get $f) (local.get $h))))
+    (local.set $cb (f64.sub (f64.mul (local.get $f) (local.get $g)) (f64.mul (local.get $d) (local.get $i))))
+    (local.set $cc (f64.sub (f64.mul (local.get $d) (local.get $h)) (f64.mul (local.get $e) (local.get $g))))
+    (local.set $scale
+      (f64.div (f64.const 1)
+        (f64.add
+          (f64.add (f64.mul (local.get $a) (local.get $ca)) (f64.mul (local.get $b) (local.get $cb)))
+          (f64.mul (local.get $c) (local.get $cc)))))
+    (f64.store (local.get $destination) (f64.mul (local.get $ca) (local.get $scale)))
+    (f64.store offset=8 (local.get $destination)
+      (f64.mul (f64.sub (f64.mul (local.get $c) (local.get $h)) (f64.mul (local.get $b) (local.get $i))) (local.get $scale)))
+    (f64.store offset=16 (local.get $destination)
+      (f64.mul (f64.sub (f64.mul (local.get $b) (local.get $f)) (f64.mul (local.get $c) (local.get $e))) (local.get $scale)))
+    (f64.store offset=24 (local.get $destination) (f64.mul (local.get $cb) (local.get $scale)))
+    (f64.store offset=32 (local.get $destination)
+      (f64.mul (f64.sub (f64.mul (local.get $a) (local.get $i)) (f64.mul (local.get $c) (local.get $g))) (local.get $scale)))
+    (f64.store offset=40 (local.get $destination)
+      (f64.mul (f64.sub (f64.mul (local.get $c) (local.get $d)) (f64.mul (local.get $a) (local.get $f))) (local.get $scale)))
+    (f64.store offset=48 (local.get $destination) (f64.mul (local.get $cc) (local.get $scale)))
+    (f64.store offset=56 (local.get $destination)
+      (f64.mul (f64.sub (f64.mul (local.get $b) (local.get $g)) (f64.mul (local.get $a) (local.get $h))) (local.get $scale)))
+    (f64.store offset=64 (local.get $destination)
+      (f64.mul (f64.sub (f64.mul (local.get $a) (local.get $e)) (f64.mul (local.get $b) (local.get $d))) (local.get $scale))))
+
+  (func $colorMatrixVectorComponent
+    (param $matrix i32) (param $row i32) (param $vector i32) (result f64)
+    (local $base i32)
+    (local.set $base (i32.add (local.get $matrix) (i32.mul (local.get $row) (i32.const 24))))
+    (f64.add
+      (f64.add
+        (f64.mul (f64.load (local.get $base)) (f64.load (local.get $vector)))
+        (f64.mul (f64.load offset=8 (local.get $base)) (f64.load offset=8 (local.get $vector))))
+      (f64.mul (f64.load offset=16 (local.get $base)) (f64.load offset=16 (local.get $vector)))))
+
+  (func $colorMatrixMultiply (param $a i32) (param $b i32) (param $destination i32)
+    (local $row i32) (local $column i32) (local $out i32)
+    (block $done
+      (loop $rows
+        (local.set $column (i32.const 0))
+        (loop $columns
+          (local.set $out
+            (i32.add (local.get $destination)
+              (i32.mul
+                (i32.add (i32.mul (local.get $row) (i32.const 3)) (local.get $column))
+                (i32.const 8))))
+          (f64.store (local.get $out)
+            (f64.add
+              (f64.add
+                (f64.mul
+                  (f64.load (i32.add (local.get $a) (i32.mul (local.get $row) (i32.const 24))))
+                  (f64.load (i32.add (local.get $b) (i32.mul (local.get $column) (i32.const 8)))))
+                (f64.mul
+                  (f64.load offset=8 (i32.add (local.get $a) (i32.mul (local.get $row) (i32.const 24))))
+                  (f64.load offset=24 (i32.add (local.get $b) (i32.mul (local.get $column) (i32.const 8))))))
+              (f64.mul
+                (f64.load offset=16 (i32.add (local.get $a) (i32.mul (local.get $row) (i32.const 24))))
+                (f64.load offset=48 (i32.add (local.get $b) (i32.mul (local.get $column) (i32.const 8)))))))
+          (local.set $column (i32.add (local.get $column) (i32.const 1)))
+          (br_if $columns (i32.lt_u (local.get $column) (i32.const 3))))
+        (local.set $row (i32.add (local.get $row) (i32.const 1)))
+        (br_if $rows (i32.lt_u (local.get $row) (i32.const 3))))))
+
+  ;; SMPTE RP 177: primary XYZ columns are scaled so RGB white maps to the
+  ;; declared white point. The adjacent matrix is its XYZ-to-RGB inverse.
+  (func $colorDeriveRgbMatrices
+    (param $destination i32)
+    (param $rx f64) (param $ry f64)
+    (param $gx f64) (param $gy f64)
+    (param $bx f64) (param $by f64)
+    (param $wx f64) (param $wy f64)
+    (local $inverse i32) (local $white i32)
+    (local $s0 f64) (local $s1 f64) (local $s2 f64)
+    (local.set $inverse (call $TMP))
+    (local.set $white (call $CUR))
+    (call $colorStoreXyXyz (local.get $white) (local.get $wx) (local.get $wy))
+    (f64.store (local.get $destination) (f64.div (local.get $rx) (local.get $ry)))
+    (f64.store offset=8 (local.get $destination) (f64.div (local.get $gx) (local.get $gy)))
+    (f64.store offset=16 (local.get $destination) (f64.div (local.get $bx) (local.get $by)))
+    (f64.store offset=24 (local.get $destination) (f64.const 1))
+    (f64.store offset=32 (local.get $destination) (f64.const 1))
+    (f64.store offset=40 (local.get $destination) (f64.const 1))
+    (f64.store offset=48 (local.get $destination)
+      (f64.div (f64.sub (f64.sub (f64.const 1) (local.get $rx)) (local.get $ry)) (local.get $ry)))
+    (f64.store offset=56 (local.get $destination)
+      (f64.div (f64.sub (f64.sub (f64.const 1) (local.get $gx)) (local.get $gy)) (local.get $gy)))
+    (f64.store offset=64 (local.get $destination)
+      (f64.div (f64.sub (f64.sub (f64.const 1) (local.get $bx)) (local.get $by)) (local.get $by)))
+    (call $colorMatrixInvert (local.get $destination) (local.get $inverse))
+    (local.set $s0 (call $colorMatrixVectorComponent (local.get $inverse) (i32.const 0) (local.get $white)))
+    (local.set $s1 (call $colorMatrixVectorComponent (local.get $inverse) (i32.const 1) (local.get $white)))
+    (local.set $s2 (call $colorMatrixVectorComponent (local.get $inverse) (i32.const 2) (local.get $white)))
+    (f64.store (local.get $destination) (f64.mul (f64.load (local.get $destination)) (local.get $s0)))
+    (f64.store offset=8 (local.get $destination) (f64.mul (f64.load offset=8 (local.get $destination)) (local.get $s1)))
+    (f64.store offset=16 (local.get $destination) (f64.mul (f64.load offset=16 (local.get $destination)) (local.get $s2)))
+    (f64.store offset=24 (local.get $destination) (f64.mul (f64.load offset=24 (local.get $destination)) (local.get $s0)))
+    (f64.store offset=32 (local.get $destination) (f64.mul (f64.load offset=32 (local.get $destination)) (local.get $s1)))
+    (f64.store offset=40 (local.get $destination) (f64.mul (f64.load offset=40 (local.get $destination)) (local.get $s2)))
+    (f64.store offset=48 (local.get $destination) (f64.mul (f64.load offset=48 (local.get $destination)) (local.get $s0)))
+    (f64.store offset=56 (local.get $destination) (f64.mul (f64.load offset=56 (local.get $destination)) (local.get $s1)))
+    (f64.store offset=64 (local.get $destination) (f64.mul (f64.load offset=64 (local.get $destination)) (local.get $s2)))
+    (call $colorMatrixInvert (local.get $destination) (i32.add (local.get $destination) (i32.const 72))))
+
+  ;; Linear Bradford adaptation, derived independently in each direction.
+  (func $colorDeriveAdaptation
+    (param $destination i32)
+    (param $sourceWhite i32) (param $destinationWhite i32)
+    (local $bradford i32) (local $inverse i32) (local $scaled i32)
+    (local $s0 f64) (local $s1 f64) (local $s2 f64)
+    (local.set $bradford (i32.add (global.get $COLOR_BASE) (i32.const 2704)))
+    (local.set $inverse (i32.add (global.get $COLOR_BASE) (i32.const 2784)))
+    (local.set $scaled (i32.add (global.get $COLOR_BASE) (i32.const 2864)))
+    (f64.store (local.get $bradford) (f64.const 0.8951))
+    (f64.store offset=8 (local.get $bradford) (f64.const 0.2664))
+    (f64.store offset=16 (local.get $bradford) (f64.const -0.1614))
+    (f64.store offset=24 (local.get $bradford) (f64.const -0.7502))
+    (f64.store offset=32 (local.get $bradford) (f64.const 1.7135))
+    (f64.store offset=40 (local.get $bradford) (f64.const 0.0367))
+    (f64.store offset=48 (local.get $bradford) (f64.const 0.0389))
+    (f64.store offset=56 (local.get $bradford) (f64.const -0.0685))
+    (f64.store offset=64 (local.get $bradford) (f64.const 1.0296))
+    (call $colorMatrixInvert (local.get $bradford) (local.get $inverse))
+    (local.set $s0
+      (f64.div
+        (call $colorMatrixVectorComponent (local.get $bradford) (i32.const 0) (local.get $destinationWhite))
+        (call $colorMatrixVectorComponent (local.get $bradford) (i32.const 0) (local.get $sourceWhite))))
+    (local.set $s1
+      (f64.div
+        (call $colorMatrixVectorComponent (local.get $bradford) (i32.const 1) (local.get $destinationWhite))
+        (call $colorMatrixVectorComponent (local.get $bradford) (i32.const 1) (local.get $sourceWhite))))
+    (local.set $s2
+      (f64.div
+        (call $colorMatrixVectorComponent (local.get $bradford) (i32.const 2) (local.get $destinationWhite))
+        (call $colorMatrixVectorComponent (local.get $bradford) (i32.const 2) (local.get $sourceWhite))))
+    (f64.store (local.get $scaled) (f64.mul (local.get $s0) (f64.load (local.get $bradford))))
+    (f64.store offset=8 (local.get $scaled) (f64.mul (local.get $s0) (f64.load offset=8 (local.get $bradford))))
+    (f64.store offset=16 (local.get $scaled) (f64.mul (local.get $s0) (f64.load offset=16 (local.get $bradford))))
+    (f64.store offset=24 (local.get $scaled) (f64.mul (local.get $s1) (f64.load offset=24 (local.get $bradford))))
+    (f64.store offset=32 (local.get $scaled) (f64.mul (local.get $s1) (f64.load offset=32 (local.get $bradford))))
+    (f64.store offset=40 (local.get $scaled) (f64.mul (local.get $s1) (f64.load offset=40 (local.get $bradford))))
+    (f64.store offset=48 (local.get $scaled) (f64.mul (local.get $s2) (f64.load offset=48 (local.get $bradford))))
+    (f64.store offset=56 (local.get $scaled) (f64.mul (local.get $s2) (f64.load offset=56 (local.get $bradford))))
+    (f64.store offset=64 (local.get $scaled) (f64.mul (local.get $s2) (f64.load offset=64 (local.get $bradford))))
+    (call $colorMatrixMultiply (local.get $inverse) (local.get $scaled) (local.get $destination)))
+
+  ;; Conversion matrices, D50 white, and parser keywords live at $COLOR_BASE.
+  (func $colorInit
+    (local $d50 i32) (local $d65 i32)
+    (local.set $d50 (i32.add (global.get $COLOR_BASE) (i32.const 1152)))
+    (local.set $d65 (call $CLIPOK))
+    (call $colorStoreXyXyz (local.get $d50) (f64.const 0.3457) (f64.const 0.3585))
+    (call $colorStoreXyXyz (local.get $d65) (f64.const 0.3127) (f64.const 0.329))
+    (call $colorDeriveRgbMatrices
+      (global.get $COLOR_BASE)
+      (f64.const 0.64) (f64.const 0.33)
+      (f64.const 0.3) (f64.const 0.6)
+      (f64.const 0.15) (f64.const 0.06)
+      (f64.const 0.3127) (f64.const 0.329))
+    (call $colorDeriveRgbMatrices
+      (i32.add (global.get $COLOR_BASE) (i32.const 144))
+      (f64.const 0.68) (f64.const 0.32)
+      (f64.const 0.265) (f64.const 0.69)
+      (f64.const 0.15) (f64.const 0.06)
+      (f64.const 0.3127) (f64.const 0.329))
+    (call $colorDeriveRgbMatrices
+      (i32.add (global.get $COLOR_BASE) (i32.const 288))
+      (f64.const 0.708) (f64.const 0.292)
+      (f64.const 0.17) (f64.const 0.797)
+      (f64.const 0.131) (f64.const 0.046)
+      (f64.const 0.3127) (f64.const 0.329))
+    (call $colorDeriveRgbMatrices
+      (i32.add (global.get $COLOR_BASE) (i32.const 432))
+      (f64.const 0.64) (f64.const 0.33)
+      (f64.const 0.21) (f64.const 0.71)
+      (f64.const 0.15) (f64.const 0.06)
+      (f64.const 0.3127) (f64.const 0.329))
+    (call $colorDeriveRgbMatrices
+      (i32.add (global.get $COLOR_BASE) (i32.const 576))
+      (f64.const 0.734699) (f64.const 0.265301)
+      (f64.const 0.159597) (f64.const 0.840403)
+      (f64.const 0.036598) (f64.const 0.000105)
+      (f64.const 0.3457) (f64.const 0.3585))
+    (call $colorDeriveAdaptation
+      (i32.add (global.get $COLOR_BASE) (i32.const 720))
+      (local.get $d50) (local.get $d65))
+    (call $colorDeriveAdaptation
+      (i32.add (global.get $COLOR_BASE) (i32.const 792))
+      (local.get $d65) (local.get $d50))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 864)) (f64.reinterpret_i64 (i64.const 4605552317838416470)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 872)) (f64.reinterpret_i64 (i64.const 4600191143509574908)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 880)) (f64.reinterpret_i64 (i64.const -4629560849248754401)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 888)) (f64.reinterpret_i64 (i64.const 4584914266525689544)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 896)) (f64.reinterpret_i64 (i64.const 4606545491472397524)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 904)) (f64.reinterpret_i64 (i64.const 4585369816424856321)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 912)) (f64.reinterpret_i64 (i64.const 4587103885741322796)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 920)) (f64.reinterpret_i64 (i64.const 4598433537585342080)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 928)) (f64.reinterpret_i64 (i64.const 4603884448168266806)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 936)) (f64.reinterpret_i64 (i64.const 4608204229460967785)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 944)) (f64.reinterpret_i64 (i64.const -4620172509204204932)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 952)) (f64.reinterpret_i64 (i64.const 4598738303367594652)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 960)) (f64.reinterpret_i64 (i64.const -4637363353018579073)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 968)) (f64.reinterpret_i64 (i64.const 4607688108164862456)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 976)) (f64.reinterpret_i64 (i64.const -4633542743511311988)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 984)) (f64.reinterpret_i64 (i64.const -4633207482472414713)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 992)) (f64.reinterpret_i64 (i64.const -4622107949664207290)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1000)) (f64.reinterpret_i64 (i64.const 4609822296009473153)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1008)) (f64.reinterpret_i64 (i64.const 4596750434405226279)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1016)) (f64.reinterpret_i64 (i64.const 4605323492974124226)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1024)) (f64.reinterpret_i64 (i64.const -4652027268745312944)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1032)) (f64.reinterpret_i64 (i64.const 4611586932626243310)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1040)) (f64.reinterpret_i64 (i64.const -4610720914496595969)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1048)) (f64.reinterpret_i64 (i64.const 4601788794568819767)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1056)) (f64.reinterpret_i64 (i64.const 4583123553312118693)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1064)) (f64.reinterpret_i64 (i64.const 4605225800330356207)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1072)) (f64.reinterpret_i64 (i64.const -4617912913652429140)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1080)) (f64.reinterpret_i64 (i64.const 4607182418800017409)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1088)) (f64.reinterpret_i64 (i64.const 4600811406583922691)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1096)) (f64.reinterpret_i64 (i64.const 4596943170058584065)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1104)) (f64.reinterpret_i64 (i64.const 4607182418800017408)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1112)) (f64.reinterpret_i64 (i64.const -4631101119588728833)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1120)) (f64.reinterpret_i64 (i64.const -4634106438128500732)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1128)) (f64.reinterpret_i64 (i64.const 4607182418800017408)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1136)) (f64.reinterpret_i64 (i64.const -4632259601654349826)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1144)) (f64.reinterpret_i64 (i64.const -4614876883849314303)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1152)) (f64.reinterpret_i64 (i64.const 4606860822843362779)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1160)) (f64.reinterpret_i64 (i64.const 4607182418800017408)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1168)) (f64.reinterpret_i64 (i64.const 4605607101106091996)))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3000)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3001)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3002)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3003)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3004)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3008)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3009)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3010)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3011)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3016)) (i32.const 104))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3017)) (i32.const 115))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3018)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3019)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3020)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3024)) (i32.const 104))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3025)) (i32.const 115))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3026)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3027)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3032)) (i32.const 104))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3033)) (i32.const 119))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3034)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3035)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3040)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3041)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3042)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3043)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3048)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3049)) (i32.const 99))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3050)) (i32.const 104))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3051)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3056)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3057)) (i32.const 107))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3058)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3059)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3060)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3061)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3064)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3065)) (i32.const 107))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3066)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3067)) (i32.const 99))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3068)) (i32.const 104))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3069)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3072)) (i32.const 99))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3073)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3074)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3075)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3076)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3077)) (i32.const 40))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3080)) (i32.const 110))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3081)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3082)) (i32.const 110))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3083)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3088)) (i32.const 100))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3089)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3090)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3096)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3097)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3098)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3099)) (i32.const 100))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3104)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3105)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3106)) (i32.const 100))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3112)) (i32.const 116))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3113)) (i32.const 117))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3114)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3115)) (i32.const 110))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3120)) (i32.const 115))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3121)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3122)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3123)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3124)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3125)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3126)) (i32.const 105))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3127)) (i32.const 110))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3128)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3129)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3130)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3136)) (i32.const 115))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3137)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3138)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3139)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3144)) (i32.const 100))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3145)) (i32.const 105))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3146)) (i32.const 115))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3147)) (i32.const 112))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3148)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3149)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3150)) (i32.const 121))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3151)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3152)) (i32.const 112))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3153)) (i32.const 51))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3160)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3161)) (i32.const 57))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3162)) (i32.const 56))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3163)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3164)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3165)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3166)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3168)) (i32.const 112))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3169)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3170)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3171)) (i32.const 112))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3172)) (i32.const 104))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3173)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3174)) (i32.const 116))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3175)) (i32.const 111))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3176)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3177)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3178)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3179)) (i32.const 98))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3184)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3185)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3186)) (i32.const 99))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3187)) (i32.const 50))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3188)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3189)) (i32.const 50))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3190)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3192)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3193)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3194)) (i32.const 99))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3195)) (i32.const 50))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3196)) (i32.const 49))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3197)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3198)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3199)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3200)) (i32.const 112))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3201)) (i32.const 113))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3208)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3209)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3210)) (i32.const 99))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3211)) (i32.const 50))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3212)) (i32.const 49))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3213)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3214)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3215)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3216)) (i32.const 104))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3217)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3218)) (i32.const 103))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3224)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3225)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3226)) (i32.const 99))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3227)) (i32.const 50))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3228)) (i32.const 49))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3229)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3230)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3231)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3232)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3233)) (i32.const 105))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3234)) (i32.const 110))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3235)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3236)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3237)) (i32.const 114))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3240)) (i32.const 120))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3241)) (i32.const 121))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3242)) (i32.const 122))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3243)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3244)) (i32.const 100))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3245)) (i32.const 53))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3246)) (i32.const 48))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3248)) (i32.const 120))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3249)) (i32.const 121))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3250)) (i32.const 122))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3251)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3252)) (i32.const 100))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3253)) (i32.const 54))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3254)) (i32.const 53))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3256)) (i32.const 120))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3257)) (i32.const 121))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3258)) (i32.const 122)))

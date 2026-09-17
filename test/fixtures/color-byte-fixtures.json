@@ -1,0 +1,127 @@
+{
+  "provenance": "Reviewed derivations from IEEE 754 binary16/binary32 encodings and the ABI v2 packing and plane-layout definitions. Integer quantization is clamp then round-half-up. Multi-byte results are little-endian.",
+  "cases": [
+    {
+      "id": "half-boundaries",
+      "op": "pack-half",
+      "input": "0000000000000080000000330010803f00f07f470000c07f",
+      "expected": "000000800100013c007c007e"
+    },
+    {
+      "id": "half-decode-classification",
+      "op": "unpack-half",
+      "input": "000000800100003c007c00fc017e",
+      "expected": "0000000000000080000080330000803f0000807f000080ff0000c07f"
+    },
+    {
+      "id": "quantize-specials-rgba8",
+      "op": "pack-signal",
+      "bits": 8,
+      "channels": 4,
+      "input": "000080ff0000807f0000c07f0000003f",
+      "expected": "00ff0080"
+    },
+    {
+      "id": "quantize-rgba10",
+      "op": "pack-signal",
+      "bits": 10,
+      "channels": 4,
+      "input": "0000003f0000803f",
+      "expected": "0002ff03"
+    },
+    {
+      "id": "quantize-rgba12",
+      "op": "pack-signal",
+      "bits": 12,
+      "channels": 4,
+      "input": "0000003f0000803f",
+      "expected": "0008ff0f"
+    },
+    {
+      "id": "quantize-rgba16",
+      "op": "pack-signal",
+      "bits": 16,
+      "channels": 4,
+      "input": "0000003f0000803f",
+      "expected": "0080ffff"
+    },
+    {
+      "id": "generic-image-copy",
+      "op": "pack-image",
+      "input": "00010203feff",
+      "expected": "00010203feff"
+    },
+    {
+      "id": "uint16-rgb-padded-rows",
+      "op": "expand-samples",
+      "input": "01000101feffadde11000201fdffefbe",
+      "width": 1,
+      "height": 2,
+      "stride": 8,
+      "sample": 1,
+      "layout": 2,
+      "expected": "01000101feffffff11000201fdffffff"
+    },
+    {
+      "id": "degraded-rgba8-identity",
+      "op": "source-degraded",
+      "input": "0080ffff",
+      "source": {
+        "width": 1,
+        "height": 1,
+        "stride": 4,
+        "sample": 0,
+        "bits": 8,
+        "layout": 3,
+        "alpha": 1,
+        "transfer": 0,
+        "primaries": 0,
+        "mode": 0,
+        "gamma": 1,
+        "referenceWhite": 203
+      },
+      "expected": "0080ffff"
+    },
+    {
+      "id": "source-linear-black",
+      "op": "source-linear",
+      "destinationPrimaries": 2,
+      "input": "0000000000000000000000000000803f",
+      "source": {
+        "width": 1,
+        "height": 1,
+        "stride": 16,
+        "sample": 3,
+        "bits": 32,
+        "layout": 3,
+        "alpha": 1,
+        "transfer": 1,
+        "primaries": 2,
+        "mode": 1,
+        "gamma": 1,
+        "referenceWhite": 203
+      },
+      "expected": "000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "source-working-linear-premultiplied",
+      "op": "source-working",
+      "input": "0000803e0000003f0000803f0000003f",
+      "source": {
+        "width": 1,
+        "height": 1,
+        "stride": 16,
+        "sample": 3,
+        "bits": 32,
+        "layout": 3,
+        "alpha": 2,
+        "transfer": 1,
+        "primaries": 2,
+        "mode": 1,
+        "gamma": 1,
+        "referenceWhite": 203
+      },
+      "expected": "0000803e0000003f0000803f0000003f"
+    }
+  ]
+}

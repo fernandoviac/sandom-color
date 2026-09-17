@@ -1,0 +1,32 @@
+{
+  "name": "@sandom/color",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Color profile compilation, deterministic color transforms, uniform palette indexing, and output packing for WebAssembly consumers.",
+  "exports": {
+    "./color.wasm": "./dist/color.wasm",
+    "./color.wat": "./dist/color.wat",
+    "./color.build.json": "./dist/color.build.json",
+    "./color.manifest.json": "./src/color.manifest.json",
+    "./watpart/*": "./src/*.watpart"
+  },
+  "files": [
+    "dist/color.wasm",
+    "dist/color.wat",
+    "dist/color.build.json",
+    "src/*.watpart",
+    "src/color.manifest.json",
+    "docs",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "publishConfig": { "access": "public" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fernandoviac/sandom-color.git"
+  }
+}

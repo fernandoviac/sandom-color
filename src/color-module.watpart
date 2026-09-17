@@ -1,0 +1,5 @@
+  (memory (export "memory") 1)
+  ;; The kernel's scratch, matrices, keywords, and parse buffers start at
+  ;; zero in the standalone module.
+  (global $COLOR_BASE i32 (i32.const 0))
+  (func (export "color_init") (call $colorInit))

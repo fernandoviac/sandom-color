@@ -1,0 +1,284 @@
+{
+  "provenance": "Expected f32 bytes are reviewed WebAssembly binary32 roundings of CSS Color 4 matrix/gamut operations and BT.2390/BT.2100 formulas at the stated inputs. Identity cases follow the ABI v2 direct-route rules. Error fields are ABI v2 record offsets.",
+  "cases": [
+    {
+      "id": "standard-srgb-direct",
+      "input": "cdcccc3dcdcc4c3e9a99993e0000003f",
+      "working": 0,
+      "sourceAlpha": 1,
+      "policy": {
+        "primaries": 0,
+        "transfer": 0,
+        "depth": 8,
+        "alpha": 1,
+        "tone": 0,
+        "range": 0,
+        "sourcePeak": 203,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 1,
+        "encodingLow": 1,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 0
+      },
+      "expected": "cdcccc3dcdcc4c3e9a99993e0000003f"
+    },
+    {
+      "id": "hdr-linear-premultiplied-bypass",
+      "input": "0000803e0000003f0000803f0000003f",
+      "working": 1,
+      "sourceAlpha": 2,
+      "policy": {
+        "primaries": 2,
+        "transfer": 1,
+        "depth": 116,
+        "alpha": 2,
+        "tone": 0,
+        "range": 0,
+        "sourcePeak": 203,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 16,
+        "encodingLow": 131072,
+        "encodingHigh": 0,
+        "alpha": 2,
+        "flags": 0
+      },
+      "expected": "0000803e0000003f0000803f0000003f"
+    },
+    {
+      "id": "bt2390-to-pq",
+      "input": "000040400000c03f0000403f0000803f",
+      "working": 1,
+      "sourceAlpha": 1,
+      "policy": {
+        "primaries": 2,
+        "transfer": 3,
+        "depth": 16,
+        "alpha": 1,
+        "tone": 1,
+        "range": 1,
+        "sourcePeak": 1000,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 1,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 8,
+        "encodingLow": 524288,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 1
+      },
+      "expected": "05aa323f1a9a1f3f82030d3f0000803f"
+    },
+    {
+      "id": "rec2020-green-to-display-p3-gamut",
+      "input": "000000000000803f000000000000803f",
+      "working": 1,
+      "sourceAlpha": 1,
+      "policy": {
+        "primaries": 1,
+        "transfer": 0,
+        "depth": 8,
+        "alpha": 1,
+        "tone": 0,
+        "range": 0,
+        "sourcePeak": 203,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 1,
+        "encodingLow": 256,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 0
+      },
+      "expected": "00000000854a783fd652c73e0000803f"
+    },
+    {
+      "id": "nan-rgb-propagation",
+      "input": "0000c07fcdcc4c3e9a99993e0000003f",
+      "working": 0,
+      "sourceAlpha": 1,
+      "policy": {
+        "primaries": 0,
+        "transfer": 0,
+        "depth": 8,
+        "alpha": 1,
+        "tone": 0,
+        "range": 0,
+        "sourcePeak": 203,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 1,
+        "encodingLow": 1,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 0
+      },
+      "expected": "0000c07f0000c07f0000c07f0000003f"
+    },
+    {
+      "id": "capability-depth-rejection",
+      "op": "validate",
+      "policy": {
+        "primaries": 0,
+        "transfer": 0,
+        "depth": 10,
+        "alpha": 1,
+        "tone": 0,
+        "range": 0,
+        "sourcePeak": 203,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 1,
+        "encodingLow": 1,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 0
+      },
+      "error": { "code": 1, "field": 12 }
+    },
+    {
+      "id": "capability-alpha-rejection",
+      "op": "validate",
+      "policy": {
+        "primaries": 0,
+        "transfer": 0,
+        "depth": 8,
+        "alpha": 2,
+        "tone": 0,
+        "range": 0,
+        "sourcePeak": 203,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 1,
+        "encodingLow": 1,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 0
+      },
+      "error": { "code": 1, "field": 16 }
+    },
+    {
+      "id": "capability-encoding-rejection",
+      "op": "validate",
+      "policy": {
+        "primaries": 1,
+        "transfer": 0,
+        "depth": 8,
+        "alpha": 1,
+        "tone": 0,
+        "range": 0,
+        "sourcePeak": 203,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 1,
+        "encodingLow": 1,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 0
+      },
+      "error": { "code": 1, "field": 8 }
+    },
+    {
+      "id": "adaptive-bt2390-base",
+      "op": "validate",
+      "policy": {
+        "primaries": 0,
+        "transfer": 0,
+        "depth": 8,
+        "alpha": 0,
+        "tone": 0,
+        "range": 2,
+        "sourcePeak": 1000,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 1,
+        "sourceMin": 0.005
+      },
+      "capability": {
+        "depthMask": 1,
+        "encodingLow": 1,
+        "encodingHigh": 0,
+        "alpha": 0,
+        "flags": 0
+      }
+    },
+    {
+      "id": "mastering-required",
+      "op": "validate",
+      "policy": {
+        "primaries": 2,
+        "transfer": 3,
+        "depth": 16,
+        "alpha": 1,
+        "tone": 1,
+        "range": 1,
+        "sourcePeak": 1000,
+        "targetPeak": 203,
+        "white": 1,
+        "referenceWhite": 203,
+        "gamut": 0,
+        "masteringPresent": 0,
+        "sourceMin": 0
+      },
+      "capability": {
+        "depthMask": 8,
+        "encodingLow": 524288,
+        "encodingHigh": 0,
+        "alpha": 1,
+        "flags": 1
+      },
+      "error": { "code": 3, "field": 68 }
+    }
+  ]
+}

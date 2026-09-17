@@ -1,0 +1,11 @@
+{
+  "fmt": { "exclude": ["."] },
+  "tasks": {
+    "build": "deno task wasm",
+    "wasm": "deno run --allow-read --allow-write tools/build-wasm.js",
+    "wasm:check": "deno run --allow-read --allow-write tools/build-wasm.js --check",
+    "test": "deno task wasm:check && deno test -A test/",
+    "check": "deno task test",
+    "package:check": "deno task wasm:check && deno run -A tools/check-package.js"
+  }
+}

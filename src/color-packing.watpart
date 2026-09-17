@@ -1,0 +1,176 @@
+  ;; Standalone byte/layout operations. All spans are allocation-arena spans;
+  ;; destinations must not overlap their input. Sizes are bounded before writes.
+  ;; Math.round on a nonnegative magnitude, without the double-rounding
+  ;; error of floor(value + 0.5) immediately below a half-integer.
+  (func $packing_round (param $value f64) (result i32)
+    (local $floor f64)
+    (local.set $floor (f64.floor (local.get $value)))
+    (i32.add (i32.trunc_f64_u (local.get $floor))
+      (f64.ge (f64.sub (local.get $value) (local.get $floor)) (f64.const 0.5))))
+
+  (func $packing_half (export "color_float_to_half") (param $value f64) (result i32)
+    (local $sign i32) (local $m f64) (local $e i32) (local $fraction i32)
+    (if (f64.ne (local.get $value) (local.get $value)) (then (return (i32.const 32256))))
+    (local.set $sign (i32.and (i32.wrap_i64 (i64.shr_u (i64.reinterpret_f64 (local.get $value)) (i64.const 48))) (i32.const 32768)))
+    (local.set $m (f64.abs (local.get $value)))
+    (if (f64.ge (local.get $m) (f64.const 65520)) (then (return (i32.or (local.get $sign) (i32.const 31744)))))
+    (if (f64.lt (local.get $m) (f64.const 0.00006103515625))
+      (then (return (i32.or (local.get $sign) (call $packing_round (f64.mul (local.get $m) (f64.const 16777216)))))))
+    (local.set $e (i32.sub (i32.wrap_i64 (i64.shr_u (i64.reinterpret_f64 (local.get $m)) (i64.const 52))) (i32.const 1023)))
+    (local.set $fraction
+      (call $packing_round
+        (f64.mul
+          (f64.sub
+            (f64.div (local.get $m) (f64.reinterpret_i64 (i64.shl (i64.extend_i32_u (i32.add (local.get $e) (i32.const 1023))) (i64.const 52))))
+            (f64.const 1))
+          (f64.const 1024))))
+    (i32.or (local.get $sign) (i32.add (i32.shl (i32.add (local.get $e) (i32.const 15)) (i32.const 10)) (local.get $fraction))))
+
+  (func $packing_unhalf (export "color_half_to_float") (param $bits i32) (result f64)
+    (local $e i32) (local $fraction i32) (local $value f64)
+    (local.set $e (i32.and (i32.shr_u (local.get $bits) (i32.const 10)) (i32.const 31)))
+    (local.set $fraction (i32.and (local.get $bits) (i32.const 1023)))
+    (if (i32.eqz (local.get $e))
+      (then (local.set $value (f64.mul (f64.convert_i32_u (local.get $fraction)) (f64.const 0.000000059604644775390625))))
+      (else (if (i32.eq (local.get $e) (i32.const 31))
+        (then (if (local.get $fraction) (then (return (f64.const nan)))) (local.set $value (f64.const inf)))
+        (else (local.set $value (f64.mul (f64.add (f64.const 1) (f64.div (f64.convert_i32_u (local.get $fraction)) (f64.const 1024)))
+          (f64.reinterpret_i64 (i64.shl (i64.extend_i32_u (i32.add (local.get $e) (i32.const 1008))) (i64.const 52)))))))))
+    (f64.copysign (local.get $value) (f64.reinterpret_i64 (i64.shl (i64.extend_i32_u (i32.and (local.get $bits) (i32.const 32768))) (i64.const 48)))))
+
+  (func $packing_quantize (param $value f64) (param $max f64) (result i32)
+    (if (i32.or (f64.ne (local.get $value) (local.get $value)) (f64.le (local.get $value) (f64.const 0))) (then (return (i32.const 0))))
+    (if (f64.ge (local.get $value) (f64.const 1)) (then (return (i32.trunc_f64_u (local.get $max)))))
+    (call $packing_round (f64.mul (local.get $value) (local.get $max))))
+
+  (func $packing_size (export "color_packing_size") (param $width i32) (param $height i32) (param $bytes i32) (result i32)
+    (local $size i64)
+    (if (i32.or (i32.le_s (local.get $width) (i32.const 0)) (i32.le_s (local.get $height) (i32.const 0))) (then (return (i32.const 0))))
+    ;; Width and height are signed-positive, so the first product cannot overflow i64.
+    (local.set $size (i64.mul (i64.extend_i32_u (local.get $width)) (i64.extend_i32_u (local.get $height))))
+    (if (i64.gt_u (local.get $size) (i64.const 268427264)) (then (return (i32.const 0))))
+    (local.set $size (i64.mul (local.get $size) (i64.extend_i32_u (local.get $bytes))))
+    (if (i64.gt_u (local.get $size) (i64.const 268427264)) (then (return (i32.const 0))))
+    (i32.wrap_i64 (local.get $size)))
+
+  (func $packing_buffers (param $src i32) (param $length i32) (param $dst i32) (param $needed i32) (param $capacity i32) (result i32)
+    (if (i32.eqz (call $color_span (local.get $src) (local.get $length))) (then (return (call $color_fail (i32.const 2) (i32.const 0)))))
+    (if (i32.lt_u (local.get $capacity) (local.get $needed)) (then (return (call $color_fail (i32.const 8) (i32.const 1)))))
+    (if (i32.eqz (call $color_span (local.get $dst) (local.get $capacity))) (then (return (call $color_fail (i32.const 2) (i32.const 1)))))
+    (if (i32.and (i32.lt_u (local.get $src) (i32.add (local.get $dst) (local.get $needed))) (i32.lt_u (local.get $dst) (i32.add (local.get $src) (local.get $length))))
+      (then (return (call $color_fail (i32.const 2) (i32.const 1)))))
+    (i32.const 0))
+
+  (func $packing_alignment (param $src i32) (param $srcStep i32) (param $dst i32) (param $dstStep i32) (result i32)
+    (if (i32.rem_u (local.get $src) (local.get $srcStep)) (then (return (call $color_fail (i32.const 2) (i32.const 0)))))
+    (if (i32.rem_u (local.get $dst) (local.get $dstStep)) (then (return (call $color_fail (i32.const 2) (i32.const 1)))))
+    (i32.const 0))
+
+  (func (export "color_pack_signal") (param $src i32) (param $count i32) (param $bits i32) (param $channels i32) (param $dst i32) (param $capacity i32) (result i32)
+    (local $sourceSize i32) (local $size i32) (local $status i32) (local $i i32) (local $value i32) (local $step i32) (local $max f64)
+    (if (i32.eqz (i32.or (i32.or (i32.eq (local.get $bits) (i32.const 8)) (i32.eq (local.get $bits) (i32.const 10))) (i32.or (i32.eq (local.get $bits) (i32.const 12)) (i32.eq (local.get $bits) (i32.const 16)))))
+      (then (return (call $color_fail (i32.const 1) (i32.const 2)))))
+    (if (i32.and (i32.ne (local.get $channels) (i32.const 3)) (i32.ne (local.get $channels) (i32.const 4))) (then (return (call $color_fail (i32.const 1) (i32.const 3)))))
+    (if (i32.gt_u (local.get $count) (i32.const 67106816)) (then (return (call $color_fail (i32.const 2) (i32.const 1)))))
+    (if (i32.and (i32.eq (local.get $channels) (i32.const 3)) (i32.ne (i32.and (local.get $count) (i32.const 3)) (i32.const 0)))
+      (then (return (call $color_fail (i32.const 2) (i32.const 1)))))
+    (local.set $sourceSize (i32.mul (local.get $count) (i32.const 4)))
+    (local.set $step (select (i32.const 1) (i32.const 2) (i32.eq (local.get $bits) (i32.const 8))))
+    (local.set $size (i32.mul (select (local.get $count) (i32.mul (i32.div_u (local.get $count) (i32.const 4)) (i32.const 3)) (i32.eq (local.get $channels) (i32.const 4))) (local.get $step)))
+    (local.set $status (call $packing_buffers (local.get $src) (local.get $sourceSize) (local.get $dst) (local.get $size) (local.get $capacity)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (local.set $status (call $packing_alignment (local.get $src) (i32.const 4) (local.get $dst) (local.get $step)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (local.set $max (f64.convert_i32_u (i32.sub (i32.shl (i32.const 1) (local.get $bits)) (i32.const 1))))
+    (block $done (loop $sample
+      (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
+      (if (i32.or (i32.eq (local.get $channels) (i32.const 4)) (i32.ne (i32.and (local.get $i) (i32.const 3)) (i32.const 3)))
+        (then
+          (local.set $value (call $packing_quantize (f64.promote_f32 (f32.load (i32.add (local.get $src) (i32.mul (local.get $i) (i32.const 4))))) (local.get $max)))
+          (if (i32.eq (local.get $step) (i32.const 1)) (then (i32.store8 (local.get $dst) (local.get $value))) (else (i32.store16 (local.get $dst) (local.get $value))))
+          (local.set $dst (i32.add (local.get $dst) (local.get $step)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $sample)))
+    (i32.const 0))
+
+  ;; Byte-container callers validate their typed plane separately; the raw
+  ;; container's half payload may itself start at an unaligned byte address.
+  (func $packing_half_array (param $src i32) (param $count i32) (param $dst i32) (param $capacity i32) (param $unpack i32) (param $byteContainer i32) (result i32)
+    (local $sourceSize i32) (local $size i32) (local $status i32) (local $i i32)
+    (if (i32.gt_u (local.get $count) (i32.const 67106816)) (then (return (call $color_fail (i32.const 2) (i32.const 1)))))
+    (local.set $sourceSize (i32.mul (local.get $count) (select (i32.const 2) (i32.const 4) (local.get $unpack))))
+    (local.set $size (i32.mul (local.get $count) (select (i32.const 4) (i32.const 2) (local.get $unpack))))
+    (local.set $status (call $packing_buffers (local.get $src) (local.get $sourceSize) (local.get $dst) (local.get $size) (local.get $capacity)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (if (i32.eqz (local.get $byteContainer))
+      (then
+        (local.set $status (call $packing_alignment
+          (local.get $src) (select (i32.const 2) (i32.const 4) (local.get $unpack))
+          (local.get $dst) (select (i32.const 4) (i32.const 2) (local.get $unpack))))
+        (if (local.get $status) (then (return (local.get $status))))))
+    (block $done (loop $sample
+      (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
+      (if (local.get $unpack)
+        (then
+          (f32.store
+            (i32.add (local.get $dst) (i32.mul (local.get $i) (i32.const 4)))
+            (f32.demote_f64
+              (call $packing_unhalf
+                (i32.load16_u (i32.add (local.get $src) (i32.mul (local.get $i) (i32.const 2))))))))
+        (else
+          (i32.store16
+            (i32.add (local.get $dst) (i32.mul (local.get $i) (i32.const 2)))
+            (call $packing_half
+              (f64.promote_f32
+                (f32.load (i32.add (local.get $src) (i32.mul (local.get $i) (i32.const 4)))))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $sample)))
+    (i32.const 0))
+  (func (export "color_pack_half") (param $src i32) (param $count i32) (param $dst i32) (param $capacity i32) (result i32)
+    (call $packing_half_array (local.get $src) (local.get $count) (local.get $dst) (local.get $capacity) (i32.const 0) (i32.const 0)))
+  (func (export "color_unpack_half") (param $src i32) (param $count i32) (param $dst i32) (param $capacity i32) (result i32)
+    (call $packing_half_array (local.get $src) (local.get $count) (local.get $dst) (local.get $capacity) (i32.const 1) (i32.const 0)))
+
+  (func (export "color_expand_samples") (param $src i32) (param $length i32) (param $width i32) (param $height i32) (param $stride i32) (param $sample i32) (param $layout i32) (param $dst i32) (param $capacity i32) (result i32)
+    (local $step i32) (local $channels i32) (local $size i32) (local $status i32) (local $alpha i32) (local $x i32) (local $y i32) (local $c i32) (local $base i32) (local $value i32) (local $index i32)
+    (if (i32.gt_u (local.get $sample) (i32.const 3)) (then (return (call $color_fail (i32.const 1) (i32.const 5)))))
+    (if (i32.gt_u (local.get $layout) (i32.const 3)) (then (return (call $color_fail (i32.const 1) (i32.const 6)))))
+    (local.set $step (select (i32.const 1) (select (i32.const 4) (i32.const 2) (i32.eq (local.get $sample) (i32.const 3))) (i32.eqz (local.get $sample))))
+    (local.set $channels (i32.add (local.get $layout) (i32.const 1)))
+    (local.set $size (call $packing_size (local.get $width) (local.get $height) (i32.mul (local.get $step) (i32.const 4))))
+    (if (i32.eqz (local.get $size)) (then (return (call $color_fail (i32.const 2) (i32.const 2)))))
+    (if (i32.or (i32.lt_u (local.get $stride) (i32.mul (i32.mul (local.get $width) (local.get $channels)) (local.get $step))) (i32.rem_u (local.get $stride) (local.get $step)))
+      (then (return (call $color_fail (i32.const 2) (i32.const 4)))))
+    (if (i64.ne (i64.mul (i64.extend_i32_u (local.get $stride)) (i64.extend_i32_u (local.get $height))) (i64.extend_i32_u (local.get $length)))
+      (then (return (call $color_fail (i32.const 2) (i32.const 1)))))
+    (local.set $status (call $packing_buffers (local.get $src) (local.get $length) (local.get $dst) (local.get $size) (local.get $capacity)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (local.set $status (call $packing_alignment (local.get $src) (local.get $step) (local.get $dst) (local.get $step)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (local.set $alpha (select (i32.const 255) (select (i32.const 65535) (select (i32.const 15360) (i32.const 1065353216) (i32.eq (local.get $sample) (i32.const 2))) (i32.eq (local.get $sample) (i32.const 1))) (i32.eqz (local.get $sample))))
+    (loop $row
+      (local.set $x (i32.const 0))
+      (loop $pixel
+        (local.set $base (i32.add (local.get $src) (i32.add (i32.mul (local.get $y) (local.get $stride)) (i32.mul (i32.mul (local.get $x) (local.get $channels)) (local.get $step)))))
+        (local.set $c (i32.const 0))
+        (loop $channel
+          (local.set $value (local.get $alpha))
+          (if (i32.or (i32.lt_u (local.get $c) (i32.const 3)) (i32.eqz (i32.and (local.get $channels) (i32.const 1))))
+            (then
+              (local.set $index (select (local.get $c) (select (i32.const 1) (i32.const 0) (i32.eq (local.get $c) (i32.const 3))) (i32.ge_u (local.get $channels) (i32.const 3))))
+              (local.set $index (i32.add (local.get $base) (i32.mul (local.get $index) (local.get $step))))
+              (if (i32.eq (local.get $step) (i32.const 1)) (then (local.set $value (i32.load8_u (local.get $index))))
+                (else (if (i32.eq (local.get $step) (i32.const 2)) (then (local.set $value (i32.load16_u (local.get $index)))) (else (local.set $value (i32.load (local.get $index)))))))))
+          (if (i32.eq (local.get $step) (i32.const 1)) (then (i32.store8 (local.get $dst) (local.get $value)))
+            (else (if (i32.eq (local.get $step) (i32.const 2)) (then (i32.store16 (local.get $dst) (local.get $value))) (else (i32.store (local.get $dst) (local.get $value))))))
+          (local.set $dst (i32.add (local.get $dst) (local.get $step)))
+          (local.set $c (i32.add (local.get $c) (i32.const 1))) (br_if $channel (i32.lt_u (local.get $c) (i32.const 4))))
+        (local.set $x (i32.add (local.get $x) (i32.const 1))) (br_if $pixel (i32.lt_u (local.get $x) (local.get $width))))
+      (local.set $y (i32.add (local.get $y) (i32.const 1))) (br_if $row (i32.lt_u (local.get $y) (local.get $height))))
+    (i32.const 0))
+
+  ;; Copy a plain interleaved byte span. Container framing belongs to the codec.
+  (func (export "color_pack_image") (param $src i32) (param $length i32) (param $dst i32) (param $capacity i32) (result i32)
+    (local $status i32)
+    (local.set $status (call $packing_buffers (local.get $src) (local.get $length) (local.get $dst) (local.get $length) (local.get $capacity)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (memory.copy (local.get $dst) (local.get $src) (local.get $length))
+    (i32.const 0))
