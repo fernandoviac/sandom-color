@@ -2,9 +2,9 @@
 
 This project owns reusable color management for WebAssembly consumers. Its
 maintained WAT compiles ICC profiles, applies deterministic color and output
-policy, parses CSS colors, exposes embeddable primitives, performs bulk CPU
-transforms, packs generic sample planes, and builds bounded uniform palettes and
-RGBA8 palette indices.
+policy, parses and interpolates CSS colors, exposes embeddable primitives,
+performs bulk CPU transforms, packs generic sample planes, and builds bounded
+uniform palettes and RGBA8 palette indices.
 
 ## Packages
 

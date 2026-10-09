@@ -49,9 +49,10 @@ an exact sample field.
 The shared kernel owns sRGB, arbitrary gamma, PQ, HLG, Rec.2020, and ProPhoto
 transfers; RGB/XYZ and Bradford matrices; Lab and OKLab conversion; BT.2390 tone
 mapping; CSS Color 4 gamut mapping; tagged-color routing; working-space
-selection; CSS parsing; and the 203-candela reference-white convention. PQ and
-HLG enter the Rec.2020 working space directly. Missing tagged components become
-zero for conversion while the parse record retains the authored missing mask.
+selection; CSS parsing and interpolation; and the 203-candela reference-white
+convention. PQ and HLG enter the Rec.2020 working space directly. Missing tagged
+components become zero for conversion while the parse record retains the
+authored missing mask.
 
 ## Records
 
@@ -113,9 +114,72 @@ syntax preprocessing. Success writes exactly `color_parse_result_size` bytes at
 |     72 | `f64`     | reference white         |
 
 Lab, LCH, OKLab, and OKLCH complete their conversion components and clear the
-conversion missing mask while preserving `authored missing`. ProPhoto and XYZ
-D50 infer D50; other supported spaces use D65. Successful CSS records use
-straight alpha and reference white 203.
+conversion missing mask while preserving `authored missing`. HSL and HWB convert
+a missing component as zero, so their conversion mask is clear while
+`authored missing` keeps it. ProPhoto and XYZ D50 infer D50; other supported
+spaces use D65. Successful CSS records use straight alpha and reference white
+203.
+
+## CSS color interpolation
+
+The interpolation operations implement CSS Color 4 interpolation for CSS Color
+5 `color-mix()`. An operand is a `color_mix_operand_size` (40) byte record,
+eight-byte aligned:
+
+| Offset | Type      | Meaning                                         |
+| -----: | --------- | ----------------------------------------------- |
+|      0 | 3 x `f64` | components in the operand's space               |
+|     24 | `f64`     | alpha                                           |
+|     32 | `i32`     | missing mask: bits 0-2 components, bit 3 alpha  |
+|     36 | `i32`     | `color_mix_space_*`                             |
+
+Spaces are sRGB, OKLab, Lab, OKLCh, LCh, HSL, and HWB. sRGB components are
+extended encoded values; Lab-family components are L, a, b; LCh-family
+components are L, C, and hue in degrees; HSL is hue, saturation, and lightness
+and HWB is hue, whiteness, and blackness, with fractions rather than
+percentages. A missing component or alpha stores zero.
+
+A `color-mix()` computed value is serialized to six significant digits and
+compared with Chrome's, so the operations compute as Chrome's `blink::Color`
+does: every operand value is a single-precision number stored in its `f64`
+field, and each conversion and interpolation step is Chrome's float operation
+in Chrome's order. OKLCh converts directly to and from OKLab and LCh to and
+from Lab; every other conversion runs through XYZ D50 with skcms's
+single-precision matrices (the ICC fixed-point sRGB matrix, Bradford D65 to
+D50) and Chrome's OKLab matrices. sRGB is never an intermediate between the
+OKLab and Lab families.
+
+- `color_mix_operand_from_parse(operand)` makes an operand of the last
+  successful CSS parse in its authored form's space, keeping authored missing
+  components. Hex, `rgb()`, and `color()` enter as sRGB; `color()` outside sRGB
+  converts to extended sRGB.
+- `color_mix_operand_from_srgb(operand, r, g, b, alpha)` makes an sRGB operand
+  for a named color, `transparent`, or a resolved `currentcolor`.
+- `color_mix_convert(source, space, destination)` converts into an
+  interpolation space. A missing component carries forward to the analogous
+  component (reds, greens, blues, lightness, colorfulness, hue, opponent a,
+  opponent b; HWB whiteness and blackness have none); other missing components
+  convert as zero. The result's hue is powerless, and so missing, when LCh or
+  OKLCh chroma is 0.02 or below, HSL saturation is zero, or HWB whiteness and
+  blackness sum to one or more. These thresholds are Chrome's. An operand
+  already in the space is copied unchanged.
+- `color_mix_interpolate(first, second, hue, progress, alphaMultiplier,
+  result)` interpolates two operands of one space at `progress`, the second
+  operand's share in [0, 1]. A component missing from one operand takes the
+  other's value; one missing from both stays missing. Every component but hue
+  is premultiplied by alpha. `hue` is `color_mix_hue_shorter`, `_longer`,
+  `_increasing`, or `_decreasing`. The result alpha is scaled by
+  `alphaMultiplier` in [0, 1]; alpha is clamped to [0, 1], and the
+  premultiplied lightness and chroma to their ranges. `progress` and
+  `alphaMultiplier` are rounded to single precision, as Chrome's are.
+- `color_mix_to_srgb(operand)` writes the operand as extended encoded sRGB at
+  `color_vec_offset`; missing components count as zero.
+
+Each returns one on success. A bad record span or alignment reports
+`color_error_span_dimensions`, a bad space, hue method, or a pair of operands in
+different spaces `color_error_enum_version`, and a progress or multiplier
+outside its range `color_error_numeric_parameter`; `color_error_field()` names
+the argument position.
 
 ## ICC scope
 

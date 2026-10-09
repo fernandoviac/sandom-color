@@ -38,6 +38,8 @@ The current manifest reserves 9,728 bytes from `$COLOR_BASE`:
 - bytes 1,152 through 1,175 hold the D50 XYZ white point;
 - bytes 2,048 through 2,455 hold vector and operation scratch;
 - bytes 2,560 through 2,639 hold the completed 80-byte CSS result;
+- bytes 2,640 through 2,663 hold the last parse's authored components, which
+  `color_mix_operand_from_parse` reads;
 - bytes 2,704 through 2,935 hold initialization-only matrix scratch;
 - bytes 4,096 through 6,143 hold up to 2,048 CSS input bytes;
 - bytes 6,144 through 9,727 hold CSS token and parser scratch.
