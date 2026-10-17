@@ -8,13 +8,11 @@ uniform palettes and RGBA8 palette indices.
 
 ## Packages
 
-- npm target: `@sandom/color`
-- GitHub target: `fernandoviac/sandom-color`
-- local repository: `sandom-color`
+- npm: `@sandom/color`
+- library set: `https://cdn.urania-libs.com`, under `sandom-color/dist/color.wasm`
 
-No package has been published yet. Local sibling consumers may compose the
-maintained WAT directly before publication; publishing and later pinning the
-fetched artifact remain separate release work.
+0.3.0 interpolates `color-mix()` in the predefined `color()` spaces and
+carries the CSS Color 4 OKLab matrices.
 
 ## Boundaries
 

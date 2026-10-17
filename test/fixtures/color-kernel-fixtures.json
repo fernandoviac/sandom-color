@@ -139,13 +139,13 @@
       "op": "gamut_map_css_color_4",
       "args": [1, 0, 0],
       "input": [0, 1, 0],
-      "expectedF64": "00000000000000000218069ffde2eb3fb61e05f6a666c73f"
+      "expectedF64": "000000000000000098bdad1cbde2eb3f0eea3ce6c46bc73f"
     },
     {
       "op": "xyz_d65_to_oklab",
       "args": [],
       "input": [0.2, 0.5, 0.4],
-      "expectedF64": "25c88e0c4b57e83fa92cffe657e9d0bfd06584fd65f7a33f"
+      "expectedF64": "acc8abf44b57e83f7962319020ead0bfd03088fba602a43f"
     },
     {
       "op": "lab_to_xyz_d50",

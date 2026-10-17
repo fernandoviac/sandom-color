@@ -133,11 +133,15 @@ eight-byte aligned:
 |     32 | `i32`     | missing mask: bits 0-2 components, bit 3 alpha  |
 |     36 | `i32`     | `color_mix_space_*`                             |
 
-Spaces are sRGB, OKLab, Lab, OKLCh, LCh, HSL, and HWB. sRGB components are
-extended encoded values; Lab-family components are L, a, b; LCh-family
-components are L, C, and hue in degrees; HSL is hue, saturation, and lightness
-and HWB is hue, whiteness, and blackness, with fractions rather than
-percentages. A missing component or alpha stores zero.
+Interpolation spaces are sRGB, OKLab, Lab, OKLCh, LCh, HSL, HWB, and the
+predefined `color()` spaces: `color_mix_space_srgb_linear`, `_display_p3`,
+`_display_p3_linear`, `_a98_rgb`, `_prophoto_rgb`, `_rec2020`, `_xyz_d50`, and
+`_xyz_d65`. An operand in a predefined space can also come from its authored
+`color()`. sRGB components are extended encoded values; Lab-family components
+are L, a, b; LCh-family components are L, C, and hue in degrees; HSL is hue,
+saturation, and lightness and HWB is hue, whiteness, and blackness, with
+fractions rather than percentages; a predefined space holds its `color()`
+components. A missing component or alpha stores zero.
 
 A `color-mix()` computed value is serialized to six significant digits and
 compared with Chrome's, so the operations compute as Chrome's `blink::Color`
@@ -147,18 +151,27 @@ in Chrome's order. OKLCh converts directly to and from OKLab and LCh to and
 from Lab; every other conversion runs through XYZ D50 with skcms's
 single-precision matrices (the ICC fixed-point sRGB matrix, Bradford D65 to
 D50) and Chrome's OKLab matrices. sRGB is never an intermediate between the
-OKLab and Lab families.
+OKLab and Lab families. A predefined space converts to XYZ D50 as
+`Color::ToXYZD50` does: the `SkNamedTransferFn` function, then the
+`SkNamedGamut` matrix that Chrome's `GetSkColorSpaceParams` gives the space.
+`srgb-linear` converts to sRGB with skcms's inverse of the sRGB transfer
+function, as `Color::ToSRGB` does. A conversion into a predefined space runs
+as `Color::ConvertToColorSpace`: XYZ D50, skcms's inverse of the space's
+matrix, then the inverse of its transfer function as Chrome's
+`skcms::TransferFunction_apply_inverse` computes it.
 
 - `color_mix_operand_from_parse(operand)` makes an operand of the last
   successful CSS parse in its authored form's space, keeping authored missing
-  components. Hex, `rgb()`, and `color()` enter as sRGB; `color()` outside sRGB
-  converts to extended sRGB.
+  components. Hex and `rgb()` enter as sRGB; `color()` keeps its predefined
+  space. A `color()` space that Chrome does not parse (`rec2100-pq`,
+  `rec2100-hlg`, `rec2100-linear`) converts to extended sRGB.
 - `color_mix_operand_from_srgb(operand, r, g, b, alpha)` makes an sRGB operand
   for a named color, `transparent`, or a resolved `currentcolor`.
-- `color_mix_convert(source, space, destination)` converts into an
-  interpolation space. A missing component carries forward to the analogous
-  component (reds, greens, blues, lightness, colorfulness, hue, opponent a,
-  opponent b; HWB whiteness and blackness have none); other missing components
+- `color_mix_convert(source, space, destination)` converts an operand of any
+  space into an interpolation space. A missing component carries forward to the
+  analogous component (reds, greens, blues, lightness, colorfulness, hue,
+  opponent a, opponent b, where X, Y, and Z are reds, greens, and blues;
+  HWB whiteness and blackness have none); other missing components
   convert as zero. The result's hue is powerless, and so missing, when LCh or
   OKLCh chroma is 0.02 or below, HSL saturation is zero, or HWB whiteness and
   blackness sum to one or more. These thresholds are Chrome's. An operand
@@ -172,8 +185,8 @@ OKLab and Lab families.
   `alphaMultiplier` in [0, 1]; alpha is clamped to [0, 1], and the
   premultiplied lightness and chroma to their ranges. `progress` and
   `alphaMultiplier` are rounded to single precision, as Chrome's are.
-- `color_mix_to_srgb(operand)` writes the operand as extended encoded sRGB at
-  `color_vec_offset`; missing components count as zero.
+- `color_mix_to_srgb(operand)` writes an operand of any space as extended
+  encoded sRGB at `color_vec_offset`; missing components count as zero.
 
 Each returns one on success. A bad record span or alignment reports
 `color_error_span_dimensions`, a bad space, hue method, or a pair of operands in

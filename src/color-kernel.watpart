@@ -1618,6 +1618,10 @@
         (if (i32.eq (local.get $primaries) (i32.const -1))
           (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3136)) (i32.const 4))
             (then (local.set $primaries (i32.const 0)) (local.set $transfer (i32.const 0))))))
+        ;; display-p3-linear before its prefix display-p3.
+        (if (i32.eq (local.get $primaries) (i32.const -1))
+          (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3264)) (i32.const 17))
+            (then (local.set $primaries (i32.const 1)) (local.set $transfer (i32.const 1))))))
         (if (i32.eq (local.get $primaries) (i32.const -1))
           (then (if (call $match_kw (i32.add (global.get $COLOR_BASE) (i32.const 3144)) (i32.const 10))
             (then (local.set $primaries (i32.const 1)) (local.set $transfer (i32.const 0))))))
@@ -1811,11 +1815,15 @@
   ;; An operand is a 40-byte record: 0 three f64 components in the
   ;; operand's space, 24 f64 alpha, 32 i32 missing mask (bits 0-2 the
   ;; components, bit 3 alpha), 36 i32 space. Spaces: 0 sRGB, 1 OKLab,
-  ;; 2 Lab, 3 OKLCh, 4 LCh, 5 HSL, 6 HWB. Units: sRGB 0..1 (extended);
-  ;; Lab-family L, a, b; LCh-family L, C, hue degrees; HSL hue degrees,
-  ;; saturation and lightness as fractions; HWB hue, whiteness and
-  ;; blackness as fractions. A missing component and missing alpha store
-  ;; zero.
+  ;; 2 Lab, 3 OKLCh, 4 LCh, 5 HSL, 6 HWB, and the predefined color()
+  ;; spaces 7 srgb-linear, 8 display-p3, 9 display-p3-linear, 10 a98-rgb,
+  ;; 11 prophoto-rgb, 12 rec2020, 13 xyz-d50, 14 xyz-d65. Spaces 0 to 6
+  ;; are interpolation spaces; a predefined space is an operand's authored
+  ;; space only. Units: sRGB 0..1 (extended); Lab-family L, a, b;
+  ;; LCh-family L, C, hue degrees; HSL hue degrees, saturation and
+  ;; lightness as fractions; HWB hue, whiteness and blackness as
+  ;; fractions; a predefined space its color() components. A missing
+  ;; component and missing alpha store zero.
   ;;
   ;; Conversion follows the analogous-component carry, the zero
   ;; substitution of missing components, and the powerless-hue rules;
@@ -1837,16 +1845,18 @@
   ;; values, written exactly: skcms's sRGB matrix (ICC 16.16 fixed point),
   ;; skcms_AdaptToXYZD50(0.3127, 0.3290) for D65 to D50, and Chrome's
   ;; OKLab literals; each inverse is skcms_Matrix3x3_invert's (double
-  ;; arithmetic rounded to float). Operand components therefore hold
-  ;; f32 values.
+  ;; arithmetic rounded to float). A predefined space converts to XYZ D50
+  ;; as Color::ToXYZD50: the SkNamedTransferFn function, then the
+  ;; SkNamedGamut matrix, of GetSkColorSpaceParams. Operand components
+  ;; therefore hold f32 values.
   ;; ------------------------------------------------------------------
 
   (func $mix_operand_valid (param $operand i32) (result i32)
     (i32.and (i32.eqz (i32.and (local.get $operand) (i32.const 7)))
       (call $color_memory_span (local.get $operand) (global.get $COLOR_MIX_OPERAND_SIZE))))
 
-  ;; The interpolation space of an authored CSS form: hex, rgb() and color()
-  ;; enter as sRGB.
+  ;; The space of an authored CSS form: hex and rgb() enter as sRGB;
+  ;; color() is resolved by $mix_color_function_space.
   (func $mix_form_space (param $form i32) (result i32)
     (if (i32.eq (local.get $form) (i32.const 3)) (then (return (i32.const 5))))
     (if (i32.eq (local.get $form) (i32.const 4)) (then (return (i32.const 6))))
@@ -1856,8 +1866,26 @@
     (if (i32.eq (local.get $form) (i32.const 8)) (then (return (i32.const 3))))
     (i32.const 0))
 
+  ;; The predefined space of a color() with these primaries and transfer,
+  ;; or -1 for a space Chrome does not parse (rec2100-pq, rec2100-hlg,
+  ;; rec2100-linear).
+  (func $mix_color_function_space (param $primaries i32) (param $transfer i32) (result i32)
+    (local $key i32)
+    (local.set $key (i32.or (i32.shl (local.get $primaries) (i32.const 4)) (local.get $transfer)))
+    (if (i32.eqz (local.get $key)) (then (return (i32.const 0))))
+    (if (i32.eq (local.get $key) (i32.const 0x01)) (then (return (i32.const 7))))
+    (if (i32.eq (local.get $key) (i32.const 0x10)) (then (return (i32.const 8))))
+    (if (i32.eq (local.get $key) (i32.const 0x11)) (then (return (i32.const 9))))
+    (if (i32.eq (local.get $key) (i32.const 0x32)) (then (return (i32.const 10))))
+    (if (i32.eq (local.get $key) (i32.const 0x46)) (then (return (i32.const 11))))
+    (if (i32.eq (local.get $key) (i32.const 0x25)) (then (return (i32.const 12))))
+    (if (i32.eq (local.get $key) (i32.const 0x51)) (then (return (i32.const 13))))
+    (if (i32.eq (local.get $key) (i32.const 0x61)) (then (return (i32.const 14))))
+    (i32.const -1))
+
   ;; The hue component index of a space, or -1.
   (func $mix_hue_index (param $space i32) (result i32)
+    (if (i32.ge_u (local.get $space) (i32.const 7)) (then (return (i32.const -1))))
     (if (i32.ge_u (local.get $space) (i32.const 5)) (then (return (i32.const 0))))
     (if (i32.ge_u (local.get $space) (i32.const 3)) (then (return (i32.const 2))))
     (i32.const -1))
@@ -2099,6 +2127,233 @@
             (f32.const -0x1.c28f8p-5)))))
     (select (f32.neg (local.get $magnitude)) (local.get $magnitude) (f32.lt (local.get $x) (f32.const 0))))
 
+  ;; Chrome's skcms::TransferFunction_apply (skia/ext/skcms_ext.cc) of a
+  ;; transfer function whose e and f are zero, on each component of the
+  ;; register, sign-mirrored: c|x| at or below d, otherwise
+  ;; max(a|x| + b, 0) raised to g, which is the base itself when g is one.
+  (func $cm_transfer (param $g f32) (param $a f32) (param $b f32) (param $c f32) (param $d f32)
+    (call $cm_set
+      (call $cm_transfer_value (global.get $cm0) (local.get $g) (local.get $a) (local.get $b) (local.get $c) (local.get $d))
+      (call $cm_transfer_value (global.get $cm1) (local.get $g) (local.get $a) (local.get $b) (local.get $c) (local.get $d))
+      (call $cm_transfer_value (global.get $cm2) (local.get $g) (local.get $a) (local.get $b) (local.get $c) (local.get $d))))
+
+  (func $cm_transfer_value
+    (param $x f32) (param $g f32) (param $a f32) (param $b f32) (param $c f32) (param $d f32) (result f32)
+    (local $magnitude f32)
+    (local.set $magnitude (f32.abs (local.get $x)))
+    (if (f32.le (local.get $magnitude) (local.get $d))
+      (then (local.set $magnitude (f32.mul (local.get $c) (local.get $magnitude))))
+      (else
+        (local.set $magnitude
+          (f32.max (f32.add (f32.mul (local.get $a) (local.get $magnitude)) (local.get $b)) (f32.const 0)))
+        (if (f32.ne (local.get $g) (f32.const 1))
+          (then (local.set $magnitude (call $cm_pow (local.get $magnitude) (local.get $g)))))))
+    (select (f32.neg (local.get $magnitude)) (local.get $magnitude) (f32.lt (local.get $x) (f32.const 0))))
+
+  ;; SkNamedGamut::kDisplayP3 (0.515102f ...).
+  (func $cm_display_p3_to_xyz_d50
+    (call $cm_matrix
+      (f32.const 0x1.07bb74p-1) (f32.const 0x1.2af8ep-2) (f32.const 0x1.41d96ep-3)
+      (f32.const 0x1.edf0d4p-3) (f32.const 0x1.626cc2p-1) (f32.const 0x1.10b82ep-4)
+      (f32.const -0x1.1318b6p-10) (f32.const 0x1.57188p-5) (f32.const 0x1.9199fep-1)))
+
+  ;; SkNamedGamut::kAdobeRGB: 0x9C18 0x348D 0x2631 / 0x4FA5 0xA02C 0x102F /
+  ;; 0x04FC 0x0F95 0xBE9C over 65536.
+  (func $cm_a98_rgb_to_xyz_d50
+    (call $cm_matrix
+      (f32.const 0x1.383p-1) (f32.const 0x1.a468p-3) (f32.const 0x1.3188p-3)
+      (f32.const 0x1.3e94p-2) (f32.const 0x1.4058p-1) (f32.const 0x1.02fp-4)
+      (f32.const 0x1.3fp-6) (f32.const 0x1.f2ap-5) (f32.const 0x1.7d38p-1)))
+
+  ;; SkNamedPrimaries::kProPhotoRGB.toXYZD50: skcms_PrimariesToXYZD50 of
+  ;; (0.7347f, 0.2653f), (0.1596f, 0.8404f), (0.0366f, 0.0001f), white
+  ;; (0.34567f, 0.35850f), in skcms's float arithmetic.
+  (func $cm_prophoto_rgb_to_xyz_d50
+    (call $cm_matrix
+      (f32.const 0x1.986836p-1) (f32.const 0x1.14e08ep-3) (f32.const 0x1.00de34p-5)
+      (f32.const 0x1.26f3b4p-2) (f32.const 0x1.6c7adp-1) (f32.const 0x1.6b43aap-14)
+      (f32.const 0x1.03e226p-22) (f32.const -0x1.815a0cp-20) (f32.const 0x1.a68214p-1)))
+
+  ;; SkNamedGamut::kRec2020 (0.673459f ...).
+  (func $cm_rec2020_to_xyz_d50
+    (call $cm_matrix
+      (f32.const 0x1.58cf9ep-1) (f32.const 0x1.534614p-3) (f32.const 0x1.00346ep-3)
+      (f32.const 0x1.1dbad4p-2) (f32.const 0x1.59c5e6p-1) (f32.const 0x1.75ca88p-5)
+      (f32.const -0x1.fa4d64p-10) (f32.const 0x1.eb2eb8p-6) (f32.const 0x1.98259ep-1)))
+
+  ;; Color::ToXYZD50 of a predefined space (7 to 14) on the register.
+  ;; Transfer functions: SkNamedTransferFn::kSRGB for display-p3; k2Dot2
+  ;; (g 2.2f) for a98-rgb; kProPhotoRGB (g 1.8f); kRec2020 (g 2.22222f,
+  ;; a 0.909672f, b 0.0903276f, c 0.222222f, d 0.0812429f); kLinear for the
+  ;; others. Matrices: kSRGB for srgb-linear, kDisplayP3 for both
+  ;; display-p3 spaces, kXYZ (the identity) for xyz-d50, and
+  ;; skcms_AdaptToXYZD50(0.3127f, 0.3290f) for xyz-d65.
+  (func $cm_predefined_to_xyz_d50 (param $space i32)
+    (if (i32.eq (local.get $space) (i32.const 8))
+      (then
+        (call $cm_transfer (f32.const 0x1.333334p1) (f32.const 0x1.e54edcp-1) (f32.const 0x1.ab1232p-5)
+          (f32.const 0x1.3d0722p-4) (f32.const 0x1.4b5dccp-5))))
+    (if (i32.eq (local.get $space) (i32.const 10))
+      (then (call $cm_transfer (f32.const 0x1.19999ap1) (f32.const 1) (f32.const 0) (f32.const 0) (f32.const 0))))
+    (if (i32.eq (local.get $space) (i32.const 11))
+      (then (call $cm_transfer (f32.const 0x1.ccccccp0) (f32.const 1) (f32.const 0) (f32.const 0) (f32.const 0))))
+    (if (i32.eq (local.get $space) (i32.const 12))
+      (then
+        (call $cm_transfer (f32.const 0x1.1c71b4p1) (f32.const 0x1.d1c088p-1) (f32.const 0x1.71fb5ap-4)
+          (f32.const 0x1.c71c54p-3) (f32.const 0x1.4cc55ap-4))))
+    (if (i32.or (i32.or (i32.eq (local.get $space) (i32.const 7)) (i32.eq (local.get $space) (i32.const 9)))
+        (i32.ge_u (local.get $space) (i32.const 13)))
+      (then (call $cm_transfer (f32.const 1) (f32.const 1) (f32.const 0) (f32.const 0) (f32.const 0))))
+    (if (i32.eq (local.get $space) (i32.const 7)) (then (call $cm_linear_srgb_to_xyz_d50) (return)))
+    (if (i32.le_u (local.get $space) (i32.const 9)) (then (call $cm_display_p3_to_xyz_d50) (return)))
+    (if (i32.eq (local.get $space) (i32.const 10)) (then (call $cm_a98_rgb_to_xyz_d50) (return)))
+    (if (i32.eq (local.get $space) (i32.const 11)) (then (call $cm_prophoto_rgb_to_xyz_d50) (return)))
+    (if (i32.eq (local.get $space) (i32.const 12)) (then (call $cm_rec2020_to_xyz_d50) (return)))
+    (if (i32.eq (local.get $space) (i32.const 13))
+      (then
+        (call $cm_matrix
+          (f32.const 1) (f32.const 0) (f32.const 0)
+          (f32.const 0) (f32.const 1) (f32.const 0)
+          (f32.const 0) (f32.const 0) (f32.const 1))
+        (return)))
+    (call $cm_xyz_d65_to_d50))
+
+  ;; Chrome's skcms::TransferFunction_eval (skia/ext/skcms_ext.cc) with all
+  ;; seven parameters on one component, sign-mirrored: c|x| + f at or below
+  ;; d, otherwise max(a|x| + b, 0) raised to g, plus e.
+  (func $cm_transfer_full_value
+    (param $x f32) (param $g f32) (param $a f32) (param $b f32) (param $c f32)
+    (param $d f32) (param $e f32) (param $f f32) (result f32)
+    (local $magnitude f32)
+    (local.set $magnitude (f32.abs (local.get $x)))
+    (if (f32.le (local.get $magnitude) (local.get $d))
+      (then (local.set $magnitude (f32.add (f32.mul (local.get $c) (local.get $magnitude)) (local.get $f))))
+      (else
+        (local.set $magnitude
+          (f32.max (f32.add (f32.mul (local.get $a) (local.get $magnitude)) (local.get $b)) (f32.const 0)))
+        (if (f32.ne (local.get $g) (f32.const 1))
+          (then (local.set $magnitude (call $cm_pow (local.get $magnitude) (local.get $g)))))
+        (local.set $magnitude (f32.add (local.get $magnitude) (local.get $e)))))
+    (select (f32.neg (local.get $magnitude)) (local.get $magnitude) (f32.lt (local.get $x) (f32.const 0))))
+
+  (func $cm_transfer_full
+    (param $g f32) (param $a f32) (param $b f32) (param $c f32) (param $d f32) (param $e f32) (param $f f32)
+    (call $cm_set
+      (call $cm_transfer_full_value (global.get $cm0)
+        (local.get $g) (local.get $a) (local.get $b) (local.get $c) (local.get $d) (local.get $e) (local.get $f))
+      (call $cm_transfer_full_value (global.get $cm1)
+        (local.get $g) (local.get $a) (local.get $b) (local.get $c) (local.get $d) (local.get $e) (local.get $f))
+      (call $cm_transfer_full_value (global.get $cm2)
+        (local.get $g) (local.get $a) (local.get $b) (local.get $c) (local.get $d) (local.get $e) (local.get $f))))
+
+  ;; Color::ConvertToColorSpace into a predefined space (7 to 14) from XYZ
+  ;; D50 on the register: skcms::Matrix3x3_apply_inverse of the space's
+  ;; matrix (skcms_Matrix3x3_invert, double arithmetic rounded to float;
+  ;; the identity for xyz-d50), then skcms::TransferFunction_apply_inverse
+  ;; (skcms_ext.cc's TransferFunction_invert, with std::pow, then
+  ;; TransferFunction_eval; nothing for a linear space). The inverses:
+  ;; kSRGB is $cm_srgb_encode's; k2Dot2 is g 0x1.d1745cp-2, a 1;
+  ;; kProPhotoRGB is g 0x1.1c71c8p-1, a 1; kRec2020 is g 0x1.ccccecp-2,
+  ;; a 0x1.3bf11p0, c 0x1.200012p2, d 0x1.27cbcap-6, e -0x1.96b86p-4
+  ;; (b and f are -0).
+  (func $cm_predefined_from_xyz_d50 (param $space i32)
+    (if (i32.eq (local.get $space) (i32.const 7)) (then (call $cm_xyz_d50_to_linear_srgb) (return)))
+    (if (i32.eq (local.get $space) (i32.const 13)) (then (return)))
+    (if (i32.eq (local.get $space) (i32.const 14)) (then (call $cm_xyz_d50_to_d65) (return)))
+    (if (i32.le_u (local.get $space) (i32.const 9))
+      (then
+        (call $cm_matrix
+          (f32.const 0x1.33b7cp1) (f32.const -0x1.fad3fep-1) (f32.const -0x1.972cc2p-2)
+          (f32.const -0x1.af388cp-1) (f32.const 0x1.cc8178p0) (f32.const 0x1.06eedep-6)
+          (f32.const 0x1.8abf94p-5) (f32.const -0x1.8ed7e2p-4) (f32.const 0x1.460488p0))
+        (if (i32.eq (local.get $space) (i32.const 8))
+          (then
+            (call $cm_set
+              (call $cm_srgb_encode (global.get $cm0)) (call $cm_srgb_encode (global.get $cm1))
+              (call $cm_srgb_encode (global.get $cm2)))))
+        (return)))
+    (if (i32.eq (local.get $space) (i32.const 10))
+      (then
+        (call $cm_matrix
+          (f32.const 0x1.f66852p0) (f32.const -0x1.38aa9p-1) (f32.const -0x1.5d90c6p-2)
+          (f32.const -0x1.f51f6ap-1) (f32.const 0x1.ea88eep0) (f32.const 0x1.11c3p-5)
+          (f32.const 0x1.d6180ep-6) (f32.const -0x1.201974p-3) (f32.const 0x1.5968d4p0))
+        (call $cm_transfer_full (f32.const 0x1.d1745cp-2) (f32.const 1) (f32.const -0)
+          (f32.const 0) (f32.const 0) (f32.const 0) (f32.const 0))
+        (return)))
+    (if (i32.eq (local.get $space) (i32.const 11))
+      (then
+        (call $cm_matrix
+          (f32.const 0x1.589066p0) (f32.const -0x1.05bf92p-2) (f32.const -0x1.a2be12p-5)
+          (f32.const -0x1.16d5dcp-1) (f32.const 0x1.821756p0) (f32.const 0x1.5072b4p-6)
+          (f32.const -0x1.6848b8p-20) (f32.const 0x1.6a332cp-19) (f32.const 0x1.36394p0))
+        (call $cm_transfer_full (f32.const 0x1.1c71c8p-1) (f32.const 1) (f32.const -0)
+          (f32.const 0) (f32.const 0) (f32.const 0) (f32.const 0))
+        (return)))
+    (call $cm_matrix
+      (f32.const 0x1.a5b3d4p0) (f32.const -0x1.930c8ap-2) (f32.const -0x1.e349a4p-3)
+      (f32.const -0x1.5d801p-1) (f32.const 0x1.a5ca48p0) (f32.const 0x1.a3f6aep-7)
+      (f32.const 0x1.e5fe8p-6) (f32.const -0x1.01b4eep-4) (f32.const 0x1.40de96p0))
+    (call $cm_transfer_full (f32.const 0x1.ccccecp-2) (f32.const 0x1.3bf11p0) (f32.const -0)
+      (f32.const 0x1.200012p2) (f32.const 0x1.27cbcap-6) (f32.const -0x1.96b86p-4) (f32.const -0)))
+
+  ;; skcms's own approximate log2f_, exp2f_ and powf_ (modules/skcms), which
+  ;; skcms_TransferFunction_invert and skcms_TransferFunction_eval use.
+  (func $skcms_log2 (param $x f32) (result f32)
+    (local $bits i32) (local $m f32)
+    (local.set $bits (i32.reinterpret_f32 (local.get $x)))
+    (local.set $m (f32.reinterpret_i32 (i32.or (i32.and (local.get $bits) (i32.const 0x007fffff)) (i32.const 0x3f000000))))
+    (f32.sub
+      (f32.sub
+        (f32.sub (f32.mul (f32.convert_i32_s (local.get $bits)) (f32.const 0x1p-23)) (f32.const 0x1.f0e6eep6))
+        (f32.mul (f32.const 0x1.7f7eeap0) (local.get $m)))
+      (f32.div (f32.const 0x1.b9d346p0) (f32.add (f32.const 0x1.6889f2p-2) (local.get $m)))))
+
+  (func $skcms_exp2 (param $x f32) (result f32)
+    (local $fract f32) (local $bits f32)
+    (if (f32.gt (local.get $x) (f32.const 128)) (then (return (f32.const inf))))
+    (if (f32.lt (local.get $x) (f32.const -127)) (then (return (f32.const 0))))
+    ;; floorf_: the truncation, one less when it lies above x.
+    (local.set $fract (f32.convert_i32_s (i32.trunc_sat_f32_s (local.get $x))))
+    (if (f32.gt (local.get $fract) (local.get $x))
+      (then (local.set $fract (f32.sub (local.get $fract) (f32.const 1)))))
+    (local.set $fract (f32.sub (local.get $x) (local.get $fract)))
+    (local.set $bits
+      (f32.mul (f32.const 0x1p23)
+        (f32.add
+          (f32.sub (f32.add (local.get $x) (f32.const 0x1.e518a2p6)) (f32.mul (f32.const 0x1.7d791ap0) (local.get $fract)))
+          (f32.div (f32.const 0x1.bba5fcp4) (f32.sub (f32.const 0x1.35ebfp2) (local.get $fract))))))
+    (if (f32.ge (local.get $bits) (f32.const 0x1p31)) (then (return (f32.const inf))))
+    (if (f32.lt (local.get $bits) (f32.const 0)) (then (return (f32.const 0))))
+    (f32.reinterpret_i32 (i32.trunc_sat_f32_s (local.get $bits))))
+
+  (func $skcms_pow (param $x f32) (param $y f32) (result f32)
+    (if (f32.le (local.get $x) (f32.const 0)) (then (return (f32.const 0))))
+    (if (f32.eq (local.get $x) (f32.const 1)) (then (return (f32.const 1))))
+    (call $skcms_exp2 (f32.mul (call $skcms_log2 (local.get $x)) (local.get $y))))
+
+  ;; Color::ToSRGB of srgb-linear: skcms_TransferFunction_eval of
+  ;; skcms_TransferFunction_invert(&SkNamedTransferFn::kSRGB), both
+  ;; skcms's C functions over its approximate powf_. The inverse is g
+  ;; 0x1.aaaaaap-2, a 0x1.2325p0, b -0, c 12.92f, d 0x1.9a5c62p-9, e
+  ;; -0x1.c25p-5, f -0.
+  (func $cm_srgb_linear_encode (param $x f32) (result f32)
+    (local $magnitude f32)
+    ;; x *= sign keeps a negative zero.
+    (local.set $magnitude
+      (select (f32.neg (local.get $x)) (local.get $x) (f32.lt (local.get $x) (f32.const 0))))
+    (if (f32.lt (local.get $magnitude) (f32.const 0x1.9a5c62p-9))
+      (then
+        (local.set $magnitude (f32.add (f32.mul (f32.const 0x1.9d70a4p3) (local.get $magnitude)) (f32.const -0))))
+      (else
+        (local.set $magnitude
+          (f32.add
+            (call $skcms_pow
+              (f32.add (f32.mul (f32.const 0x1.2325p0) (local.get $magnitude)) (f32.const -0))
+              (f32.const 0x1.aaaaaap-2))
+            (f32.const -0x1.c25p-5)))))
+    (select (f32.neg (local.get $magnitude)) (local.get $magnitude) (f32.lt (local.get $x) (f32.const 0))))
+
   ;; gfx::LabToXYZD50's inverse transfer: delta 24/116, slope 108/841,
   ;; offset 16/116 (float divisions).
   (func $cm_lab_inverse_f (param $t f32) (result f32)
@@ -2281,6 +2536,8 @@
 
   ;; Color::ToXYZD50 on the register.
   (func $cm_to_xyz_d50 (param $space i32)
+    (if (i32.ge_u (local.get $space) (i32.const 7))
+      (then (call $cm_predefined_to_xyz_d50 (local.get $space)) (return)))
     (if (i32.ge_u (local.get $space) (i32.const 5))
       (then (call $cm_cylinder_to_srgb (local.get $space))))
     (if (i32.or (i32.eqz (local.get $space)) (i32.ge_u (local.get $space) (i32.const 5)))
@@ -2296,10 +2553,18 @@
       (then (call $cm_oklab_to_xyz_d50))
       (else (call $cm_lab_to_xyz_d50))))
 
-  ;; Color::ToSRGB on the register: encoded extended sRGB.
+  ;; Color::ToSRGB on the register: encoded extended sRGB. srgb-linear
+  ;; has its own route; every other space but sRGB, HSL and HWB goes
+  ;; through XYZ D50.
   (func $cm_to_srgb (param $space i32)
     (if (i32.eqz (local.get $space)) (then (return)))
-    (if (i32.ge_u (local.get $space) (i32.const 5))
+    (if (i32.eq (local.get $space) (i32.const 7))
+      (then
+        (call $cm_set
+          (call $cm_srgb_linear_encode (global.get $cm0)) (call $cm_srgb_linear_encode (global.get $cm1))
+          (call $cm_srgb_linear_encode (global.get $cm2)))
+        (return)))
+    (if (i32.or (i32.eq (local.get $space) (i32.const 5)) (i32.eq (local.get $space) (i32.const 6)))
       (then (call $cm_cylinder_to_srgb (local.get $space)) (return)))
     (call $cm_to_xyz_d50 (local.get $space))
     (call $cm_xyz_d50_to_linear_srgb)
@@ -2312,6 +2577,11 @@
   ;; powerless.
   (func $cm_convert (param $from i32) (param $to i32) (result i32)
     (if (i32.eq (local.get $from) (local.get $to)) (then (return (i32.const 0))))
+    (if (i32.ge_u (local.get $to) (i32.const 7))
+      (then
+        (call $cm_to_xyz_d50 (local.get $from))
+        (call $cm_predefined_from_xyz_d50 (local.get $to))
+        (return (i32.const 0))))
     (if (i32.or (i32.eq (local.get $to) (i32.const 1)) (i32.eq (local.get $to) (i32.const 2)))
       (then
         ;; OKLCh to OKLab, LCh to Lab.
@@ -2349,9 +2619,11 @@
   ;; The analogous-component category of each component of a space (CSS
   ;; Color 4 "Interpolating with Missing Components"), four bits per
   ;; component: 1 red, 2 green, 3 blue, 4 lightness, 5 colorfulness, 6 hue,
-  ;; 7 opponent a, 8 opponent b, 0 none (HWB whiteness and blackness).
+  ;; 7 opponent a, 8 opponent b, 0 none (HWB whiteness and blackness). The
+  ;; predefined spaces are RGB spaces, XYZ included, as in Chrome.
   (func $mix_categories (param $space i32) (result i32)
-    (if (i32.eqz (local.get $space)) (then (return (i32.const 0x321))))
+    (if (i32.or (i32.eqz (local.get $space)) (i32.ge_u (local.get $space) (i32.const 7)))
+      (then (return (i32.const 0x321))))
     (if (i32.le_u (local.get $space) (i32.const 2)) (then (return (i32.const 0x874))))
     (if (i32.le_u (local.get $space) (i32.const 4)) (then (return (i32.const 0x654))))
     (if (i32.eq (local.get $space) (i32.const 5)) (then (return (i32.const 0x456))))
@@ -2432,8 +2704,9 @@
       (f32.demote_f64 (f64.max (f64.const 0) (f64.min (f64.const 1) (local.get $alpha)))) (local.get $mask)))
 
   ;; The operand of the last successful CSS parse, in its authored form's
-  ;; space. color() outside sRGB enters as extended sRGB, whose missing
-  ;; components stay analogous to its own.
+  ;; space: color() stays in its predefined space, as Chrome keeps it. A
+  ;; color() space Chrome does not parse enters as extended sRGB, whose
+  ;; missing components stay analogous to its own.
   (func $color_mix_operand_from_parse (export "color_mix_operand_from_parse") (param $operand i32) (result i32)
     (local $form i32) (local $space i32) (local $mask i32)
     (call $color_begin)
@@ -2445,13 +2718,17 @@
         (select (i32.const 8) (i32.const 0) (i32.load (call $OUT_ALPHA_MISSING)))))
     (call $copy_vec (call $OUT_AUTHORED) (call $VEC))
     (local.set $space (call $mix_form_space (local.get $form)))
-    (if (i32.and (i32.eq (local.get $form) (i32.const 9))
-        (i32.or (i32.load (call $OUT_PRIMARIES)) (i32.load (call $OUT_TRANSFER))))
+    (if (i32.eq (local.get $form) (i32.const 9))
       (then
-        (drop
-          (call $color_convert_tagged_to_standard
-            (i32.load (call $OUT_PRIMARIES)) (i32.load (call $OUT_TRANSFER))
-            (f64.load (call $OUT_GAMMA)) (i32.and (local.get $mask) (i32.const 7))))))
+        (local.set $space
+          (call $mix_color_function_space (i32.load (call $OUT_PRIMARIES)) (i32.load (call $OUT_TRANSFER))))
+        (if (i32.lt_s (local.get $space) (i32.const 0))
+          (then
+            (drop
+              (call $color_convert_tagged_to_standard
+                (i32.load (call $OUT_PRIMARIES)) (i32.load (call $OUT_TRANSFER))
+                (f64.load (call $OUT_GAMMA)) (i32.and (local.get $mask) (i32.const 7))))
+            (local.set $space (i32.const 0))))))
     (call $mix_store (local.get $operand) (local.get $space)
       (call $load0 (call $VEC)) (call $load1 (call $VEC)) (call $load2 (call $VEC))
       (f64.load (call $OUT_ALPHA)) (local.get $mask))
@@ -2468,20 +2745,20 @@
       (local.get $r) (local.get $g) (local.get $b) (local.get $alpha) (i32.const 0))
     (i32.const 1))
 
-  ;; Convert an operand into an interpolation space. $source and
-  ;; $destination may be the same record.
+  ;; Convert an operand into an interpolation space (0 to 14) from any
+  ;; operand space. $source and $destination may be the same record.
   (func $color_mix_convert (export "color_mix_convert")
     (param $source i32) (param $space i32) (param $destination i32) (result i32)
     (local $from i32) (local $mask i32) (local $carried i32) (local $alpha f32)
     (call $color_begin)
     (if (i32.eqz (call $mix_operand_valid (local.get $source)))
       (then (return (call $color_reject (global.get $COLOR_ERROR_SPAN_DIMENSIONS) (i32.const 0)))))
-    (if (i32.gt_u (local.get $space) (i32.const 6))
+    (if (i32.gt_u (local.get $space) (i32.const 14))
       (then (return (call $color_reject (global.get $COLOR_ERROR_ENUM_VERSION) (i32.const 1)))))
     (if (i32.eqz (call $mix_operand_valid (local.get $destination)))
       (then (return (call $color_reject (global.get $COLOR_ERROR_SPAN_DIMENSIONS) (i32.const 2)))))
     (local.set $from (i32.load offset=36 (local.get $source)))
-    (if (i32.gt_u (local.get $from) (i32.const 6))
+    (if (i32.gt_u (local.get $from) (i32.const 14))
       (then (return (call $color_reject (global.get $COLOR_ERROR_ENUM_VERSION) (i32.const 0)))))
     (local.set $mask (i32.load offset=32 (local.get $source)))
     (if (i32.eq (local.get $from) (local.get $space))
@@ -2544,7 +2821,7 @@
     (if (i32.eqz (call $mix_operand_valid (local.get $second)))
       (then (return (call $color_reject (global.get $COLOR_ERROR_SPAN_DIMENSIONS) (i32.const 1)))))
     (local.set $space (i32.load offset=36 (local.get $first)))
-    (if (i32.or (i32.gt_u (local.get $space) (i32.const 6))
+    (if (i32.or (i32.gt_u (local.get $space) (i32.const 14))
         (i32.ne (local.get $space) (i32.load offset=36 (local.get $second))))
       (then (return (call $color_reject (global.get $COLOR_ERROR_ENUM_VERSION) (i32.const 1)))))
     (if (i32.gt_u (local.get $method) (i32.const 3))
@@ -2619,13 +2896,14 @@
       (f32.mul (local.get $alpha) (f32.demote_f64 (local.get $alphaMultiplier))) (local.get $mask))
     (i32.const 1))
 
-  ;; An operand as encoded extended sRGB in VEC; missing components count
-  ;; as zero. The alpha stays in the operand.
+  ;; An operand of any operand space as encoded extended sRGB in VEC
+  ;; (Color::ToSRGB); missing components count as zero. The alpha stays in
+  ;; the operand.
   (func $color_mix_to_srgb (export "color_mix_to_srgb") (param $operand i32) (result i32)
     (call $color_begin)
     (if (i32.eqz (call $mix_operand_valid (local.get $operand)))
       (then (return (call $color_reject (global.get $COLOR_ERROR_SPAN_DIMENSIONS) (i32.const 0)))))
-    (if (i32.gt_u (i32.load offset=36 (local.get $operand)) (i32.const 6))
+    (if (i32.gt_u (i32.load offset=36 (local.get $operand)) (i32.const 14))
       (then (return (call $color_reject (global.get $COLOR_ERROR_ENUM_VERSION) (i32.const 0)))))
     (call $mix_load_resolved (local.get $operand))
     (call $cm_to_srgb (i32.load offset=36 (local.get $operand)))
@@ -2965,6 +3243,8 @@
     (call $colorDeriveAdaptation
       (i32.add (global.get $COLOR_BASE) (i32.const 792))
       (local.get $d65) (local.get $d50))
+    ;; Matrices 12 to 15, the CSS Color 4 OKLab constants (conversions.js,
+    ;; XYZtoLMS, LMStoXYZ, LMStoOKLab, OKLabtoLMS) as exact f64 bits.
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 864)) (f64.reinterpret_i64 (i64.const 4605552317838416470)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 872)) (f64.reinterpret_i64 (i64.const 4600191143509574908)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 880)) (f64.reinterpret_i64 (i64.const -4629560849248754401)))
@@ -2972,17 +3252,17 @@
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 896)) (f64.reinterpret_i64 (i64.const 4606545491472397524)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 904)) (f64.reinterpret_i64 (i64.const 4585369816424856321)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 912)) (f64.reinterpret_i64 (i64.const 4587103885741322796)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 920)) (f64.reinterpret_i64 (i64.const 4598433537585342080)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 928)) (f64.reinterpret_i64 (i64.const 4603884448168266806)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 936)) (f64.reinterpret_i64 (i64.const 4608204229460967785)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 944)) (f64.reinterpret_i64 (i64.const -4620172509204204932)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 952)) (f64.reinterpret_i64 (i64.const 4598738303367594652)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 960)) (f64.reinterpret_i64 (i64.const -4637363353018579073)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 968)) (f64.reinterpret_i64 (i64.const 4607688108164862456)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 976)) (f64.reinterpret_i64 (i64.const -4633542743511311988)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 984)) (f64.reinterpret_i64 (i64.const -4633207482472414713)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 992)) (f64.reinterpret_i64 (i64.const -4622107949664207290)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1000)) (f64.reinterpret_i64 (i64.const 4609822296009473153)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 920)) (f64.reinterpret_i64 (i64.const 4598431736144858531)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 928)) (f64.reinterpret_i64 (i64.const 4603881711073709048)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 936)) (f64.reinterpret_i64 (i64.const 4608204194924334977)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 944)) (f64.reinterpret_i64 (i64.const -4620172466507113974)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 952)) (f64.reinterpret_i64 (i64.const 4598740710351532451)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 960)) (f64.reinterpret_i64 (i64.const -4637363634666032350)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 968)) (f64.reinterpret_i64 (i64.const 4607688113605429268)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 976)) (f64.reinterpret_i64 (i64.const -4633540289881495621)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 984)) (f64.reinterpret_i64 (i64.const -4633204366125223845)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 992)) (f64.reinterpret_i64 (i64.const -4622107468077886324)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1000)) (f64.reinterpret_i64 (i64.const 4609825689597049131)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1008)) (f64.reinterpret_i64 (i64.const 4596750434405226279)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1016)) (f64.reinterpret_i64 (i64.const 4605323492974124226)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1024)) (f64.reinterpret_i64 (i64.const -4652027268745312944)))
@@ -2992,15 +3272,15 @@
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1056)) (f64.reinterpret_i64 (i64.const 4583123553312118693)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1064)) (f64.reinterpret_i64 (i64.const 4605225800330356207)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1072)) (f64.reinterpret_i64 (i64.const -4617912913652429140)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1080)) (f64.reinterpret_i64 (i64.const 4607182418800017409)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1088)) (f64.reinterpret_i64 (i64.const 4600811406583922691)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1096)) (f64.reinterpret_i64 (i64.const 4596943170058584065)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1080)) (f64.reinterpret_i64 (i64.const 4607182418800017408)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1088)) (f64.reinterpret_i64 (i64.const 4600811406583922688)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1096)) (f64.reinterpret_i64 (i64.const 4596943170058584063)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1104)) (f64.reinterpret_i64 (i64.const 4607182418800017408)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1112)) (f64.reinterpret_i64 (i64.const -4631101119588728833)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1120)) (f64.reinterpret_i64 (i64.const -4634106438128500732)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1112)) (f64.reinterpret_i64 (i64.const -4631101119588728830)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1120)) (f64.reinterpret_i64 (i64.const -4634106438128500736)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1128)) (f64.reinterpret_i64 (i64.const 4607182418800017408)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1136)) (f64.reinterpret_i64 (i64.const -4632259601654349826)))
-    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1144)) (f64.reinterpret_i64 (i64.const -4614876883849314303)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1136)) (f64.reinterpret_i64 (i64.const -4632259601654349821)))
+    (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1144)) (f64.reinterpret_i64 (i64.const -4614876883849314304)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1152)) (f64.reinterpret_i64 (i64.const 4606860822843362779)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1160)) (f64.reinterpret_i64 (i64.const 4607182418800017408)))
     (f64.store (i32.add (global.get $COLOR_BASE) (i32.const 1168)) (f64.reinterpret_i64 (i64.const 4605607101106091996)))
@@ -3172,4 +3452,21 @@
     (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3254)) (i32.const 53))
     (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3256)) (i32.const 120))
     (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3257)) (i32.const 121))
-    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3258)) (i32.const 122)))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3258)) (i32.const 122))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3264)) (i32.const 100))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3265)) (i32.const 105))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3266)) (i32.const 115))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3267)) (i32.const 112))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3268)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3269)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3270)) (i32.const 121))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3271)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3272)) (i32.const 112))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3273)) (i32.const 51))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3274)) (i32.const 45))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3275)) (i32.const 108))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3276)) (i32.const 105))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3277)) (i32.const 110))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3278)) (i32.const 101))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3279)) (i32.const 97))
+    (i32.store8 (i32.add (global.get $COLOR_BASE) (i32.const 3280)) (i32.const 114)))
