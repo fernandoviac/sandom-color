@@ -41,6 +41,43 @@
     (i32.store (i32.add (local.get $p) (global.get $COLOR_POLICY_WHITE)) (i32.const 1))
     (i32.const 0))
 
+  ;; An empty capability for alpha mode $alpha with flags $flags: no depth
+  ;; and no encoding yet.
+  (func (export "color_capability_init") (param $capability i32) (param $alpha i32) (param $flags i32) (result i32)
+    (if (i32.or (i32.and (local.get $capability) (i32.const 3))
+          (i32.eqz (call $color_span (local.get $capability) (global.get $COLOR_CAPABILITY_SIZE))))
+      (then (return (call $color_fail (i32.const 2) (i32.const 0)))))
+    (if (i32.gt_u (local.get $alpha) (i32.const 2))
+      (then (return (call $color_fail (i32.const 1) (global.get $COLOR_CAPABILITY_ALPHA)))))
+    (memory.fill (local.get $capability) (i32.const 0) (global.get $COLOR_CAPABILITY_SIZE))
+    (i32.store (i32.add (local.get $capability) (global.get $COLOR_CAPABILITY_VERSION)) (global.get $COLOR_ABI_VERSION))
+    (i32.store (i32.add (local.get $capability) (global.get $COLOR_CAPABILITY_ALPHA)) (local.get $alpha))
+    (i32.store (i32.add (local.get $capability) (global.get $COLOR_CAPABILITY_FLAGS)) (local.get $flags))
+    (i32.const 0))
+
+  ;; Adds depth code $depth (8, 10, 12, 16, color_depth_float16,
+  ;; color_depth_float32) to the capability's depth mask.
+  (func (export "color_capability_accept_depth") (param $capability i32) (param $depth i32) (result i32)
+    (local $bit i32) (local $at i32)
+    (local.set $bit (call $color_depth_bit (local.get $depth)))
+    (if (i32.eqz (local.get $bit))
+      (then (return (call $color_fail (i32.const 1) (global.get $COLOR_CAPABILITY_DEPTH_MASK)))))
+    (local.set $at (i32.add (local.get $capability) (global.get $COLOR_CAPABILITY_DEPTH_MASK)))
+    (i32.store (local.get $at) (i32.or (i32.load (local.get $at)) (local.get $bit)))
+    (i32.const 0))
+
+  ;; Adds the encoding $primaries / $transfer: bit primaries * 8 + transfer
+  ;; of the low mask, or of the high mask from bit 32.
+  (func (export "color_capability_accept_encoding") (param $capability i32) (param $primaries i32) (param $transfer i32) (result i32)
+    (local $bit i32) (local $at i32)
+    (if (i32.or (i32.gt_u (local.get $primaries) (i32.const 6)) (i32.gt_u (local.get $transfer) (i32.const 7)))
+      (then (return (call $color_fail (i32.const 1) (global.get $COLOR_CAPABILITY_ENCODING_LOW)))))
+    (local.set $bit (i32.add (i32.mul (local.get $primaries) (i32.const 8)) (local.get $transfer)))
+    (local.set $at (i32.add (local.get $capability)
+      (select (global.get $COLOR_CAPABILITY_ENCODING_LOW) (global.get $COLOR_CAPABILITY_ENCODING_HIGH) (i32.lt_u (local.get $bit) (i32.const 32)))))
+    (i32.store (local.get $at) (i32.or (i32.load (local.get $at)) (i32.shl (i32.const 1) (i32.and (local.get $bit) (i32.const 31)))))
+    (i32.const 0))
+
   (func $color_validate_policy (export "color_validate_policy") (param $p i32) (param $capability i32) (result i32)
     (local $transfer i32) (local $range i32) (local $field i32) (local $peak f64)
     (if (i32.or (i32.and (local.get $p) (i32.const 7)) (i32.eqz (call $color_span (local.get $p) (global.get $COLOR_POLICY_SIZE))))

@@ -11,8 +11,14 @@ uniform palettes and RGBA8 palette indices.
 - npm: `@sandom/color`
 - library set: `https://cdn.urania-libs.com`, under `sandom-color/dist/color.wasm`
 
-0.3.0 interpolates `color-mix()` in the predefined `color()` spaces and
-carries the CSS Color 4 OKLab matrices.
+0.5.0 converts and mixes CSS colors in double precision with the CSS Color 4
+conversions, its powerless-component ε and its carrying forward of missing
+components, gives `color(rec2020)` the gamma 2.4 transfer, takes the legacy
+comma syntax only in `rgb()` and `hsl()` and without `none`, takes an angle
+only as a hue, and clamps a negative `hsl()` saturation to 0%. It gamut maps
+with the CSS Color 4 binary search
+with local MINDE, routes linear RGB between primaries sets by primaries code
+and converts source planes to straight sRGB RGBA8.
 
 ## Boundaries
 

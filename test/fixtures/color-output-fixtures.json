@@ -115,7 +115,7 @@
         "alpha": 1,
         "flags": 0
       },
-      "expected": "000000000a4a783fd061c73e0000803f"
+      "expected": "00000000c55c793fa7b7bf3e0000803f"
     },
     {
       "id": "nan-rgb-propagation",

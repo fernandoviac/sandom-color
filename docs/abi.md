@@ -54,6 +54,14 @@ convention. PQ and HLG enter the Rec.2020 working space directly. Missing tagged
 components become zero for conversion while the parse record retains the
 authored missing mask.
 
+HLG has two decodes. A tagged color (`color_convert_tagged_to_working` and
+`color_convert_tagged_to_standard`) is an authored CSS `rec2100-hlg` color:
+each channel decodes alone through the BT.2100 inverse OETF and scales by
+3.7743, so media white is signal 0.75 and the 18% grey card is 0.38 (CSS Color
+HDR 1 § 8.2 and § 11.3), with no system gamma. An HLG image source and an HLG
+output use the BT.2100 display transform of the 1000-candela reference display
+with system gamma 1.2 (`hlg_rgb_to_working`).
+
 ## Records
 
 Every size and offset below has a corresponding exported global.
@@ -67,11 +75,17 @@ Every size and offset below has a corresponding exported global.
   two 32-bit encoding masks, required alpha mode, and flags. Encoding bit
   `primaries * 8 + transfer` selects the low or high mask. Validation reports
   the exact rejected policy field. Capability flag bit 0 requires mastering
-  metadata for a high-range policy.
+  metadata for a high-range policy. `color_capability_init(capability, alpha,
+  flags)` writes an empty capability; `color_capability_accept_depth` and
+  `color_capability_accept_encoding` add one depth code or one
+  primaries/transfer pair, so a host never computes mask bits.
 - The 64-byte source record names a byte span, dimensions and stride, sample and
   channel layout, alpha mode, transfer, primaries, source mode, gamma, and
-  reference white. Source operations produce degraded RGBA8, destination-linear
-  `f64`, or package working-space `f64` planes.
+  reference white. Source operations produce degraded RGBA8, straight sRGB
+  RGBA8 (`color_source_srgb8`: unpremultiplied, converted from the source
+  primaries through XYZ D65, sRGB encoded, clamped and rounded half up; PQ,
+  HLG and ICC sources fail at the transfer field), destination-linear `f64`,
+  or package working-space `f64` planes.
 - The 20-byte profile-info record contains handle, profile kind, sRGB-like flag,
   stable content identity, and schema revision. Revision is currently 1 and is
   written by WAT on compile and info refresh.
@@ -117,8 +131,13 @@ Lab, LCH, OKLab, and OKLCH complete their conversion components and clear the
 conversion missing mask while preserving `authored missing`. HSL and HWB convert
 a missing component as zero, so their conversion mask is clear while
 `authored missing` keeps it. ProPhoto and XYZ D50 infer D50; other supported
-spaces use D65. Successful CSS records use straight alpha and reference white
-203.
+spaces use D65. `color(rec2020)` has primaries Rec.2020 and the gamma transfer
+with exponent 2.4 (BT.1886, CSS Color 4 §10.8); the Rec.2020 transfer id is the
+BT.2020 signal of tagged sources. Only `rgb()`, `rgba()`, `hsl()` and `hsla()`
+take the legacy comma syntax, and it takes no `none`. Only the hue of `lch()`
+and `oklch()` takes an angle. A negative `hsl()` saturation is 0% at
+parsed-value time (CSS Color 4 §7). Successful CSS records use straight alpha
+and reference white 203.
 
 ## CSS color interpolation
 
@@ -143,48 +162,40 @@ saturation, and lightness and HWB is hue, whiteness, and blackness, with
 fractions rather than percentages; a predefined space holds its `color()`
 components. A missing component or alpha stores zero.
 
-A `color-mix()` computed value is serialized to six significant digits and
-compared with Chrome's, so the operations compute as Chrome's `blink::Color`
-does: every operand value is a single-precision number stored in its `f64`
-field, and each conversion and interpolation step is Chrome's float operation
-in Chrome's order. OKLCh converts directly to and from OKLab and LCh to and
-from Lab; every other conversion runs through XYZ D50 with skcms's
-single-precision matrices (the ICC fixed-point sRGB matrix, Bradford D65 to
-D50) and Chrome's OKLab matrices. sRGB is never an intermediate between the
-OKLab and Lab families. A predefined space converts to XYZ D50 as
-`Color::ToXYZD50` does: the `SkNamedTransferFn` function, then the
-`SkNamedGamut` matrix that Chrome's `GetSkColorSpaceParams` gives the space.
-`srgb-linear` converts to sRGB with skcms's inverse of the sRGB transfer
-function, as `Color::ToSRGB` does. A conversion into a predefined space runs
-as `Color::ConvertToColorSpace`: XYZ D50, skcms's inverse of the space's
-matrix, then the inverse of its transfer function as Chrome's
-`skcms::TransferFunction_apply_inverse` computes it.
+The operations compute in double precision with the CSS Color 4 conversions
+(§11.2 and the sample code of §19): a polar form converts to its own
+rectangular form (OKLab for OKLCh, Lab for LCh, sRGB for HSL and HWB), and two
+different rectangular forms convert through XYZ D65 with the kernel's matrices
+and transfer functions. A missing component counts as zero in the conversion.
 
 - `color_mix_operand_from_parse(operand)` makes an operand of the last
   successful CSS parse in its authored form's space, keeping authored missing
   components. Hex and `rgb()` enter as sRGB; `color()` keeps its predefined
-  space. A `color()` space that Chrome does not parse (`rec2100-pq`,
-  `rec2100-hlg`, `rec2100-linear`) converts to extended sRGB.
+  space. Another `color()` space (`rec2100-pq`, `rec2100-hlg`,
+  `rec2100-linear`) converts to extended sRGB.
 - `color_mix_operand_from_srgb(operand, r, g, b, alpha)` makes an sRGB operand
   for a named color, `transparent`, or a resolved `currentcolor`.
 - `color_mix_convert(source, space, destination)` converts an operand of any
-  space into an interpolation space. A missing component carries forward to the
-  analogous component (reds, greens, blues, lightness, colorfulness, hue,
-  opponent a, opponent b, where X, Y, and Z are reds, greens, and blues;
-  HWB whiteness and blackness have none); other missing components
-  convert as zero. The result's hue is powerless, and so missing, when LCh or
-  OKLCh chroma is 0.02 or below, HSL saturation is zero, or HWB whiteness and
-  blackness sum to one or more. These thresholds are Chrome's. An operand
-  already in the space is copied unchanged.
+  space into an interpolation space. Before the conversion, the source's
+  powerless hue becomes missing (CSS Color 4 §4.4.1): HSL saturation of 0.001%
+  or less, HWB whiteness and blackness summing to 99.999% or more, LCh chroma
+  of 0.0015 or less, OKLCh chroma of 0.000004 or less; its chroma or
+  saturation becomes zero, and an HWB whiteness or blackness completes the sum
+  to 100%. A polar result's hue is powerless by the same rules. A missing
+  component carries forward to the analogous component (reds, greens, blues,
+  lightness, colorfulness, hue, opponent a, opponent b, where X, Y, and Z are
+  reds, greens, and blues; HWB whiteness and blackness have none); when every
+  source component without an analogue is missing, every result component
+  without an analogue is missing (§13.4). An operand already in the space is
+  copied unchanged.
 - `color_mix_interpolate(first, second, hue, progress, alphaMultiplier,
   result)` interpolates two operands of one space at `progress`, the second
   operand's share in [0, 1]. A component missing from one operand takes the
   other's value; one missing from both stays missing. Every component but hue
   is premultiplied by alpha. `hue` is `color_mix_hue_shorter`, `_longer`,
   `_increasing`, or `_decreasing`. The result alpha is scaled by
-  `alphaMultiplier` in [0, 1]; alpha is clamped to [0, 1], and the
-  premultiplied lightness and chroma to their ranges. `progress` and
-  `alphaMultiplier` are rounded to single precision, as Chrome's are.
+  `alphaMultiplier` in [0, 1] and clamped to [0, 1]; the other components are
+  not clamped.
 - `color_mix_to_srgb(operand)` writes an operand of any space as extended
   encoded sRGB at `color_vec_offset`; missing components count as zero.
 
@@ -245,6 +256,18 @@ success. `color_error_palette_levels`, `color_error_palette_threshold`,
 `color_error_palette_span`, and `color_error_palette_record` distinguish their
 failures; `color_error_field()` is a palette-record offset for record failures
 and an argument position for span or threshold failures.
+
+Primaries routing takes a primaries code and works on the shared vector:
+`color_linear_to_working(primaries)` and `color_working_to_linear(primaries)`
+convert between linear RGB in the set and linear Rec.2020 (no gamut map);
+`color_linear_to_xyz(primaries)` and `color_xyz_to_linear(primaries)` apply the
+set's own matrices; `color_gamut_map_css_color_4(primaries)` gamut maps working
+RGB into the set. `color_primaries_matrix(source, destination, out, capacity)`
+writes the 72-byte row-major matrix from linear `source` into linear
+`destination`, composed from the basis vectors. A D50 set (ProPhoto RGB, XYZ
+D50) adapts to and from D65 by Bradford. The XYZ sets have no RGB matrix; an
+operation that needs one, or an unknown code, returns 0. Each other operation
+returns 1.
 
 The kernel calls documented in `composition.md` are also present in standalone
 WASM. The packed-source composition test executes the same fixture set against

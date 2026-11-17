@@ -98,7 +98,7 @@
       "gamma": 1,
       "missing": 0,
       "input": [0.25, 0.5, 0.75],
-      "expectedF64": "e918afee6185af3fe918afee6185cf3fba6a63b6400ee93f"
+      "expectedF64": "c58f31772d21b43fc58f31772d21d43fc61263883200f03f"
     },
     {
       "id": "rec2020",
@@ -139,7 +139,7 @@
       "op": "gamut_map_css_color_4",
       "args": [1, 0, 0],
       "input": [0, 1, 0],
-      "expectedF64": "000000000000000098bdad1cbde2eb3f0eea3ce6c46bc73f"
+      "expectedF64": "0000000000000000df8b8970c44cec3fb06de62e5c75c53f"
     },
     {
       "op": "xyz_d65_to_oklab",

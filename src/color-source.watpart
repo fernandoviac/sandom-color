@@ -72,7 +72,9 @@
     (if (i32.and (i32.and (local.get $channels) (i32.const 1)) (i32.ne (local.get $alphaMode) (i32.const 0)))
       (then (return (call $color_fail (i32.const 1) (i32.const 32)))))
     (local.set $degraded (i32.eqz (local.get $operation)))
-    (local.set $outputStep (select (i32.const 4) (select (i32.const 24) (i32.const 16) (i32.eq (local.get $operation) (i32.const 1))) (local.get $degraded)))
+    (local.set $outputStep
+      (select (i32.const 4) (select (i32.const 24) (i32.const 16) (i32.eq (local.get $operation) (i32.const 1)))
+        (i32.or (local.get $degraded) (i32.eq (local.get $operation) (i32.const 3)))))
     (local.set $size (call $packing_size (local.get $width) (local.get $height) (local.get $outputStep)))
     (if (i32.eqz (local.get $size)) (then (return (call $color_fail (i32.const 2) (i32.const 8)))))
     (if (i64.lt_u (i64.extend_i32_u (local.get $stride)) (i64.mul (i64.extend_i32_u (local.get $width)) (i64.extend_i32_u (i32.mul (local.get $channels) (local.get $step)))))
@@ -90,6 +92,9 @@
           (then (return (call $color_fail (i32.const 1) (i32.const 40))))))
       (else
         (if (i32.eq (local.get $transfer) (i32.const 7)) (then (return (call $color_fail (i32.const 6) (i32.const 36)))))
+        (if (i32.and (i32.eq (local.get $operation) (i32.const 3))
+              (i32.or (i32.eq (local.get $transfer) (i32.const 3)) (i32.eq (local.get $transfer) (i32.const 4))))
+          (then (return (call $color_fail (i32.const 1) (i32.const 36)))))
         (if (i32.eq (local.get $operation) (i32.const 1))
           (then
             (if (i32.gt_u (local.get $destinationPrimaries) (i32.const 6))
@@ -99,11 +104,18 @@
     (local.set $status (call $packing_buffers (local.get $src) (local.get $length) (local.get $dst) (local.get $size) (local.get $capacity)))
     (if (local.get $status) (then (return (local.get $status))))
     (local.set $status (call $packing_alignment (local.get $src) (local.get $step) (local.get $dst)
-      (select (i32.const 1) (select (i32.const 8) (i32.const 4) (i32.eq (local.get $operation) (i32.const 1))) (local.get $degraded))))
+      (select (i32.const 1) (select (i32.const 8) (i32.const 4) (i32.eq (local.get $operation) (i32.const 1)))
+        (i32.or (local.get $degraded) (i32.eq (local.get $operation) (i32.const 3))))))
     (if (local.get $status) (then (return (local.get $status))))
     (local.set $maximum (f64.const 1))
     (if (i32.eq (local.get $sample) (i32.const 1))
       (then (local.set $maximum (f64.convert_i32_u (i32.sub (i32.shl (i32.const 1) (local.get $bits)) (i32.const 1))))))
+    (if (i32.eq (local.get $operation) (i32.const 3))
+      (then
+        (call $source_srgb8 (local.get $src) (local.get $width) (local.get $height) (local.get $stride) (local.get $channels)
+          (local.get $step) (local.get $sample) (local.get $maximum) (local.get $alphaMode) (local.get $transfer)
+          (local.get $gamma) (local.get $primaries) (local.get $dst))
+        (return (i32.const 0))))
     (local.set $linearScale (f64.const 1))
     (if (i32.and (i32.ne (local.get $transfer) (i32.const 3)) (i32.ne (local.get $transfer) (i32.const 4)))
       (then (local.set $linearScale (f64.div (local.get $white) (f64.const 203)))))
@@ -191,6 +203,65 @@
     (if (local.get $table) (then (drop (call $color_free (local.get $table)))))
     (i32.const 0))
 
+  ;; The 8-bit straight sRGB of one encoded value in [0, 1]: clamped,
+  ;; times 255, rounded half up (the fraction compared with one half, so no
+  ;; addition rounds first); NaN is 0.
+  (func $source_srgb8_byte (param $value f64) (result i32)
+    (local $scaled f64) (local $floor f64)
+    (local.set $scaled (f64.mul (f64.min (f64.const 1) (f64.max (f64.const 0) (local.get $value))) (f64.const 255)))
+    (local.set $floor (f64.floor (local.get $scaled)))
+    (i32.trunc_sat_f64_u
+      (select (f64.add (local.get $floor) (f64.const 1)) (local.get $floor)
+        (f64.ge (f64.sub (local.get $scaled) (local.get $floor)) (f64.const 0.5)))))
+
+  ;; Straight sRGB RGBA8 of every pixel: the alpha (1 for an opaque
+  ;; source), the color divided by a positive premultiplied alpha, decoded,
+  ;; into XYZ D65 through the source primaries, into linear sRGB, encoded.
+  (func $source_srgb8 (param $src i32) (param $width i32) (param $height i32) (param $stride i32) (param $channels i32)
+    (param $step i32) (param $sample i32) (param $maximum f64) (param $alphaMode i32) (param $transfer i32)
+    (param $gamma f64) (param $primaries i32) (param $dst i32)
+    (local $x i32) (local $y i32) (local $base i32) (local $channel i32) (local $alpha f64) (local $value f64)
+    (loop $row
+      (local.set $x (i32.const 0))
+      (loop $pixel
+        (local.set $base (i32.add (local.get $src) (i32.add (i32.mul (local.get $y) (local.get $stride))
+          (i32.mul (local.get $x) (i32.mul (local.get $channels) (local.get $step))))))
+        (local.set $alpha (f64.const 1))
+        (if (local.get $alphaMode)
+          (then (local.set $alpha (call $source_channel (local.get $base) (i32.const 3) (local.get $channels) (local.get $step)
+            (local.get $sample) (local.get $maximum) (i32.const 0)))))
+        (local.set $channel (i32.const 0))
+        (loop $readChannel
+          (local.set $value (call $source_channel (local.get $base) (local.get $channel) (local.get $channels) (local.get $step)
+            (local.get $sample) (local.get $maximum) (i32.const 0)))
+          (if (i32.and (i32.eq (local.get $alphaMode) (i32.const 2)) (f64.gt (local.get $alpha) (f64.const 0)))
+            (then (local.set $value (f64.div (local.get $value) (local.get $alpha)))))
+          (f64.store (i32.add (call $VEC) (i32.mul (local.get $channel) (i32.const 8)))
+            (call $source_decode (local.get $value) (local.get $transfer) (local.get $gamma)))
+          (local.set $channel (i32.add (local.get $channel) (i32.const 1)))
+          (br_if $readChannel (i32.lt_u (local.get $channel) (i32.const 3))))
+        (if (i32.lt_u (local.get $primaries) (i32.const 5))
+          (then (call $apply_matrix (i32.mul (local.get $primaries) (i32.const 2)))))
+        (if (i32.or (i32.eq (local.get $primaries) (i32.const 4)) (i32.eq (local.get $primaries) (i32.const 5)))
+          (then (call $apply_matrix (i32.const 10))))
+        (call $apply_matrix (i32.const 1))
+        (local.set $channel (i32.const 0))
+        (loop $writeChannel
+          (i32.store8 (i32.add (local.get $dst) (local.get $channel))
+            (call $source_srgb8_byte (call $srgb_encode (f64.load (i32.add (call $VEC) (i32.mul (local.get $channel) (i32.const 8)))))))
+          (local.set $channel (i32.add (local.get $channel) (i32.const 1)))
+          (br_if $writeChannel (i32.lt_u (local.get $channel) (i32.const 3))))
+        (i32.store8 offset=3 (local.get $dst) (call $source_srgb8_byte (local.get $alpha)))
+        (local.set $dst (i32.add (local.get $dst) (i32.const 4)))
+        (local.set $x (i32.add (local.get $x) (i32.const 1)))
+        (br_if $pixel (i32.lt_u (local.get $x) (local.get $width))))
+      (local.set $y (i32.add (local.get $y) (i32.const 1)))
+      (br_if $row (i32.lt_u (local.get $y) (local.get $height)))))
+
+  ;; Straight sRGB RGBA8 for an 8-bit display surface ($source_srgb8);
+  ;; PQ, HLG and ICC sources are rejected at the transfer field.
+  (func (export "color_source_srgb8") (param $record i32) (param $dst i32) (param $capacity i32) (result i32)
+    (call $source_prepare (local.get $record) (local.get $dst) (local.get $capacity) (i32.const 3) (i32.const 0)))
   (func (export "color_source_degraded") (param $record i32) (param $dst i32) (param $capacity i32) (result i32)
     (call $source_prepare (local.get $record) (local.get $dst) (local.get $capacity) (i32.const 0) (i32.const 0)))
   (func (export "color_source_linear") (param $record i32) (param $destinationPrimaries i32) (param $dst i32) (param $capacity i32) (result i32)

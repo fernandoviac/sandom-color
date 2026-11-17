@@ -186,6 +186,44 @@ Deno.test('HLG matches its BT.2100 breakpoints and reference display transform',
   assertVectorClose(white, [1000 / 203, 1000 / 203, 1000 / 203], 2e-3, 'HLG white');
 });
 
+// A CSS rec2100-hlg colour (CSS Color HDR 1 § 8.2 and the hlg_decode sample
+// of § 11.3): each channel decodes alone through the BT.2100 inverse OETF,
+// then scales by 3.7743, which places media white at signal 0.75 and the 18%
+// reflectance grey card at 0.38. There is no system gamma: the colour is
+// scene-referred, unlike an HLG image on the 1000-candela reference display.
+Deno.test('A tagged HLG colour decodes as CSS Color HDR 1 rec2100-hlg, channel by channel', () => {
+  const a = 0.17883277;
+  const b = 1 - 4 * a;
+  const c = 0.5 - a * Math.log(4 * a);
+  const scale = 3.7743;
+  const cssHlgDecode = (signal) =>
+    Math.sign(signal) *
+    (Math.abs(signal) <= 0.5 ? (signal ** 2 / 3) * scale : ((Math.exp((Math.abs(signal) - c) / a) + b) / 12) * scale);
+  const rows = [
+    { name: 'media white', signal: [0.75, 0.75, 0.75] },
+    { name: '18% grey card', signal: [0.38, 0.38, 0.38] },
+    { name: 'the breakpoint', signal: [0.5, 0.5, 0.5] },
+    { name: 'a colour, each channel alone', signal: [0.9, 0.2, 0.5] },
+    { name: 'full signal', signal: [1, 1, 1] },
+    { name: 'a negative channel keeps its sign', signal: [0.6, 0.3, -0.1] },
+  ];
+  const hlg = globalValue(exports, 'color_transfer_hlg');
+  const rec2020 = globalValue(exports, 'color_primaries_rec2020');
+  const failures = [];
+  for (const row of rows) {
+    const actual = vectorOperation(row.signal, () => {
+      assert(exports.color_convert_tagged_to_working(rec2020, hlg, 1, 0) === 1, `${row.name}: HLG route accepted`);
+    });
+    const expected = row.signal.map(cssHlgDecode);
+    if (actual.some((value, index) => Math.abs(value - expected[index]) > 1e-9)) {
+      failures.push(`${row.name}: ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
+    }
+  }
+  assertClose(cssHlgDecode(0.75), 1, 1e-4, 'the formula places media white at 0.75');
+  assertClose(cssHlgDecode(0.38), 0.18, 2e-3, 'the formula places the 18% grey at 0.38');
+  assert(failures.length === 0, `HLG tagged colours:\n${failures.join('\n')}`);
+});
+
 Deno.test('Lab is D50-anchored and reaches the working space through adaptation', () => {
   assertVectorClose(convertXyzD50ToLab(XYZ_WHITE_D50), [100, 0, 0], 1e-9, 'D50 white Lab');
   const workingWhite = convertXyzD65ToWorking(
@@ -211,17 +249,17 @@ const CSS_COLOR_4_OKLAB_MATRICES = Object.freeze([
     1.0000000000000000, -0.0894841775298119, -1.2914855480194092],
 ]);
 
-// oklab(from <color> l a b) of the pinned Chrome (Chrome/151.0.7922.174),
-// six significant digits. Chrome converts with skcms's single-precision
-// sRGB matrix and its OKLab literals, which color_mix_convert reproduces.
-const CHROME_OKLAB = Object.freeze([
-  ['white', [1, 1, 1], [0.999994, 0.0000455678, 0.0000200868]],
-  ['red', [1, 0, 0], [0.627966, 0.22488, 0.125859]],
-  ['lime', [0, 1, 0], [0.866435, -0.23384, 0.179502]],
-  ['blue', [0, 0, 1], [0.451981, -0.0324624, -0.311523]],
-  ['cyan', [0, 1, 1], [0.905387, -0.149403, -0.0393822]],
-  ['magenta', [1, 0, 1], [0.701669, 0.274594, -0.169133]],
-  ['yellow', [1, 1, 0], [0.967983, -0.0713198, 0.198578]],
+// The OKLab of the sRGB primaries and secondaries by the CSS Color 4 sample
+// code (§19: lin_sRGB, lin_sRGB_to_XYZ, XYZ_to_OKLab), which the
+// color-mix() arithmetic follows.
+const CSS_COLOR_4_OKLAB = Object.freeze([
+  ['white', [1, 1, 1], [1.0000000000000002, -4.996003610813204e-16, 0]],
+  ['red', [1, 0, 0], [0.6279553639214313, 0.22486306842627424, 0.12584627733058495]],
+  ['lime', [0, 1, 0], [0.8664396175234368, -0.2338875809365577, 0.1794984451609376]],
+  ['blue', [0, 0, 1], [0.4520137181744237, -0.03245697517079765, -0.3115281656775777]],
+  ['cyan', [0, 1, 1], [0.9053992360133608, -0.1494439435082286, -0.039398192151822053]],
+  ['magenta', [1, 0, 1], [0.7016738591017413, 0.274566305727563, -0.16915608446137853]],
+  ['yellow', [1, 1, 0], [0.9679827267927991, -0.07136908291823663, 0.19856971763168096]],
 ]);
 
 Deno.test('OKLab carries the CSS Color 4 constants and matches its published reference values', () => {
@@ -247,13 +285,13 @@ Deno.test('OKLab carries the CSS Color 4 constants and matches its published ref
   assertClose(redOklch[2], 29.2338, 0.2, 'red hue');
 });
 
-Deno.test('color-mix() arithmetic converts the sRGB primaries to the OKLab of the pinned Chrome', () => {
+Deno.test('color-mix() arithmetic converts the sRGB primaries to the OKLab of CSS Color 4', () => {
   const operand = runtime.alloc(globalValue(exports, 'color_mix_operand_size'));
   try {
-    for (const [name, srgb, chrome] of CHROME_OKLAB) {
+    for (const [name, srgb, expected] of CSS_COLOR_4_OKLAB) {
       assert(exports.color_mix_operand_from_srgb(operand, ...srgb, 1) === 1, `${name} operand`);
       assert(exports.color_mix_convert(operand, globalValue(exports, 'color_mix_space_oklab'), operand) === 1, `${name} converts`);
-      assertVectorClose(new Float64Array(runtime.memory.buffer, operand, 3), chrome, 1e-6, `${name} OKLab`);
+      assertVectorClose(new Float64Array(runtime.memory.buffer, operand, 3), expected, 1e-12, `${name} OKLab`);
     }
   } finally {
     runtime.free(operand);
@@ -308,4 +346,97 @@ Deno.test('CSS Color 4 gamut map brings Rec. 2020 green into sRGB with its hue k
   );
   assertClose(mappedOklch[2], sourceOklch[2], 4, 'hue within four degrees');
   assert(mappedOklch[1] < sourceOklch[1], 'chroma reduced, not clipped arbitrarily');
+});
+
+// OKLab to XYZ D65 with the CSS Color 4 matrices: OKLabtoLMS, the cube,
+// LMStoXYZ.
+function convertOklabToXyzD65(oklab) {
+  const product = (matrix, vector) => [0, 1, 2].map((row) =>
+    matrix[row * 3] * vector[0] + matrix[row * 3 + 1] * vector[1] + matrix[row * 3 + 2] * vector[2]
+  );
+  const lms = product(CSS_COLOR_4_OKLAB_MATRICES[3], oklab).map((value) => value ** 3);
+  return product(CSS_COLOR_4_OKLAB_MATRICES[1], lms);
+}
+
+// CSS Color 4, 14.2.2 "Binary Search Gamut Map with Local MINDE", step by
+// step, into an RGB destination: the reference the kernel's result is
+// compared with.
+function referenceGamutMap(workingRgb, primaries) {
+  const toDestination = (oklab) => convertXyzToLinearRgb(primaries, convertOklabToXyzD65(oklab));
+  const inGamut = (rgb) => rgb.every((value) => value >= 0 && value <= 1);
+  const clip = (oklab) => toDestination(oklab).map((value) => Math.min(Math.max(value, 0), 1));
+  const delta = (rgb, oklab) => {
+    const other = convertXyzD65ToOklab(convertLinearRgbToXyz(primaries, rgb));
+    return Math.hypot(other[0] - oklab[0], other[1] - oklab[1], other[2] - oklab[2]);
+  };
+  const origin = convertXyzD65ToOklab(convertWorkingToXyzD65(workingRgb));
+  const direct = convertXyzToLinearRgb(primaries, convertWorkingToXyzD65(workingRgb));
+  if (inGamut(direct)) return direct;
+  if (origin[0] >= 1) return [1, 1, 1];
+  if (origin[0] <= 0) return [0, 0, 0];
+  const chroma = Math.hypot(origin[1], origin[2]);
+  let current = origin;
+  let clipped = clip(current);
+  let difference = delta(clipped, current);
+  if (difference < 0.02) return clipped;
+  let minimum = 0;
+  let maximum = chroma;
+  let minimumInGamut = true;
+  while (maximum - minimum > 0.0001) {
+    const middle = (minimum + maximum) / 2;
+    current = [origin[0], origin[1] * middle / chroma, origin[2] * middle / chroma];
+    if (minimumInGamut && inGamut(toDestination(current))) {
+      minimum = middle;
+      continue;
+    }
+    clipped = clip(current);
+    difference = delta(clipped, current);
+    if (difference < 0.02) {
+      if (0.02 - difference < 0.0001) return clipped;
+      minimumInGamut = false;
+      minimum = middle;
+    } else {
+      maximum = middle;
+    }
+  }
+  return clipped;
+}
+
+// Rows: a color outside the destination (OKLCh, or working linear Rec.
+// 2020 RGB), the destination, and the 8-bit sRGB of its clip when the
+// clip is within one just noticeable difference (CSS Color 4, step 14), or
+// null for a color that the chroma search maps.
+const GAMUT_MAP_ROWS = Object.freeze([
+  // Deck UI --destructive: the clip is at deltaEOK 0.0101.
+  [{ oklch: [0.577, 0.245, 27.325] }, 'srgb', [231, 0, 11]],
+  [{ oklch: [0.7, 0.2, 140] }, 'srgb', null],
+  [{ oklch: [0.6, 0.3, 300] }, 'srgb', null],
+  [{ oklch: [0.9, 0.25, 200] }, 'srgb', null],
+  [{ working: [0, 1, 0] }, 'srgb', null],
+  [{ working: [0, 1, 0] }, 'display-p3', null],
+]);
+
+Deno.test('CSS Color 4 gamut map returns the clip within one JND and searches chroma otherwise', () => {
+  const failures = [];
+  for (const [source, primaries, clip8] of GAMUT_MAP_ROWS) {
+    let working = source.working;
+    if (source.oklch !== undefined) {
+      const [lightness, chroma, hue] = source.oklch;
+      const radians = hue * Math.PI / 180;
+      working = convertXyzD65ToWorking(
+        convertOklabToXyzD65([lightness, chroma * Math.cos(radians), chroma * Math.sin(radians)]),
+      );
+    }
+    const mapped = gamutMapCssColor4(working, primaries);
+    const expected = referenceGamutMap(working, primaries);
+    const label = `${JSON.stringify(source)} into ${primaries}`;
+    if (mapped.some((value, index) => Math.abs(value - expected[index]) > 1e-9)) {
+      failures.push(`${label}: kernel ${mapped}, reference ${expected}`);
+    }
+    if (clip8 !== null) {
+      const bytes = mapped.map((value) => Math.round(encodeSrgbTransfer(value) * 255));
+      if (bytes.some((value, index) => value !== clip8[index])) failures.push(`${label}: 8-bit ${bytes}, clip ${clip8}`);
+    }
+  }
+  assert(failures.length === 0, `gamut map rows:\n${failures.join('\n')}`);
 });
